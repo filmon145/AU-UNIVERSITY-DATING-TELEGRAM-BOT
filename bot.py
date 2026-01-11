@@ -741,6 +741,7 @@ conv_handler = ConversationHandler(
 )
 
 # ---------------- 2. The Main Execution Block ----------------
+# ---------------- 2. The Main Execution Block ----------------
 if __name__ == "__main__":
     # Windows specific event loop fix
     if sys.platform.startswith("win"):
@@ -751,10 +752,19 @@ if __name__ == "__main__":
     asyncio.set_event_loop(loop)
     loop.run_until_complete(init_db())
 
-    # Build the application
-    app = ApplicationBuilder().token("7719239133:AAE32S8nNkgvHlyk4ZNZaXQn7DjDjwK3RiE").build()
-    # Add this above app.add_handler(conv_handler)
+    import os
+    from dotenv import load_dotenv
 
+    load_dotenv()
+    TOKEN = os.getenv("BOT_TOKEN")
+    
+    # ⚠️ IMPORTANT: Add token validation!
+    if not TOKEN:
+        print("❌ ERROR: BOT_TOKEN not found in .env file")
+        print("Please create a .env file with: BOT_TOKEN=your_token_here")
+        exit(1)
+    
+    app = ApplicationBuilder().token(TOKEN).build()
 
     # 1. The Conversation Handler (Registration & Editing)
     # This MUST come first so it can capture inputs during registration
@@ -787,4 +797,12 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.PHOTO, photo_relay))
 
     print("✅ AU Dating Bot is running! Press Ctrl+C to stop.")
-    app.run_polling()
+    
+    # Add error handling for polling
+    try:
+        app.run_polling()
+    except KeyboardInterrupt:
+        print("\n🛑 Bot stopped by user")
+    except Exception as e:
+        print(f"❌ Bot crashed with error: {e}")
+        # Optionally log to file
