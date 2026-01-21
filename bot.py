@@ -187,7 +187,7 @@ async def create_tables():
             status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'accepted', 'rejected')),
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW(),
-            UNIQUE(requester_id, requested_id) WHERE status = 'pending'
+            UNIQUE(requester_id, requested_id, status)
         )
         """)
         print("  ✅ chat_requests table")
@@ -2151,4 +2151,5 @@ if __name__ == "__main__":
         print(f"❌ Fatal error starting bot: {e}")
         import traceback
         traceback.print_exc()
+
 
