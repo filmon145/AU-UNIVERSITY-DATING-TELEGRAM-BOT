@@ -3,14 +3,13 @@ import os
 import asyncio
 import asyncpg
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes,
     MessageHandler, ConversationHandler, filters, CallbackQueryHandler
 )
 from dotenv import load_dotenv
 from aiohttp import web
-import signal
 
 # Load environment variables
 load_dotenv()
@@ -36,24 +35,12 @@ if not DATABASE_URL:
     print("❌ ERROR: DATABASE_URL environment variable is required!")
     sys.exit(1)
 
-print(f"✅ Starting bot with token: {BOT_TOKEN[:10]}...")
-print(f"✅ Database URL: {DATABASE_URL[:30]}...")
-
-# Async HTTP server for health checks
-async def handle_health(request):
-    return web.Response(text="Bot is healthy")
-
-async def start_health_server():
-    app = web.Application()
-    app.router.add_get('/', handle_health)
-    app.router.add_get('/health', handle_health)
-    
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    print(f"✅ Health check server running on port {PORT}")
-    return runner, site
+print("=" * 50)
+print("🚀 Starting AU Dating Bot...")
+print(f"✅ Bot token: {BOT_TOKEN[:10]}...")
+print(f"✅ Database: {DATABASE_URL[:30]}...")
+print(f"✅ Port: {PORT}")
+print("=" * 50)
 
 # Database connection pool
 db_pool = None
@@ -139,10 +126,6 @@ async def init_db():
         print(f"❌ Database initialization error: {e}")
         raise
 
-# [KEEP ALL YOUR ORIGINAL FUNCTIONS HERE - SAME AS BEFORE]
-# Don't change any of your bot logic functions
-# Only changed the health server and main() function
-
 async def save_profile(update, context):
     """Save user profile to PostgreSQL"""
     user = update.effective_user
@@ -168,6 +151,7 @@ async def save_profile(update, context):
             context.user_data.get('hobbies'),
             context.user_data.get('preference', 'Both')
         ))
+
 # ---------------- Channel Check ----------------
 async def check_channel_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Check if user is a member of the required channel"""
@@ -632,6 +616,7 @@ async def edit_hobbies_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Registration cancelled. Use /start to begin again.")
     return ConversationHandler.END
+
 def get_main_menu():
     """Get main menu without matches button"""
     keyboard = [
@@ -640,6 +625,7 @@ def get_main_menu():
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
+# ---------------- Chat System ----------------
 async def chat_relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Relay text messages between matched users"""
     user_id = update.effective_user.id
@@ -1731,53 +1717,6 @@ async def start_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-async def chat_relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not update.message or not update.message.text:
-        return
-
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT partner_id FROM active_chats WHERE user_id = $1", user_id)
-        
-        if row:
-            partner_id = row['partner_id']
-            name_row = await conn.fetchrow("SELECT name FROM users WHERE telegram_id = $1", user_id)
-            sender_name = name_row['name'] if name_row else "User"
-
-            try:
-                await context.bot.send_message(
-                    chat_id=partner_id, 
-                    text=f"💬 {sender_name}: {update.message.text}"
-                )
-            except Exception:
-                await conn.execute("DELETE FROM active_chats WHERE user_id = $1 OR partner_id = $1", user_id)
-                await conn.execute("DELETE FROM active_chats WHERE user_id = $1 OR partner_id = $1", partner_id)
-                await update.message.reply_text("❌ Your partner is no longer available. Chat ended.")
-
-async def photo_relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Relay photos between matched users in active chat"""
-    user_id = update.effective_user.id
-    
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT partner_id FROM active_chats WHERE user_id = $1", user_id)
-            
-        if row:
-            partner_id = row['partner_id']
-            name_row = await conn.fetchrow("SELECT name FROM users WHERE telegram_id = $1", user_id)
-            sender_name = name_row['name'] if name_row else "User"
-            
-            try:
-                await context.bot.send_photo(
-                    chat_id=partner_id,
-                    photo=update.message.photo[-1].file_id,
-                    caption=f"📷 Photo from {sender_name}"
-                )
-            except Exception as e:
-                print(f"Error sending photo: {e}")
-                await conn.execute("DELETE FROM active_chats WHERE user_id = $1 OR partner_id = $1", user_id)
-                await conn.execute("DELETE FROM active_chats WHERE user_id = $1 OR partner_id = $1", partner_id)
-                await update.message.reply_text("❌ Your partner is no longer available. Chat ended.")
-
 async def stop_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     partner_id = None
@@ -1916,7 +1855,7 @@ async def handle_request_action(update: Update, context: ContextTypes.DEFAULT_TY
             reply_markup=None
         )
 
-# ---------------- Main Application Setup ----------------
+# ---------------- Conversation Handler ----------------
 conv_handler = ConversationHandler(
     entry_points=[CommandHandler('start', start)],
     states={
@@ -1941,15 +1880,12 @@ conv_handler = ConversationHandler(
     per_message=False
 )
 
-# ... [all your existing code above] ...
-
+# ---------------- MAIN FUNCTION - FIXED FOR RAILWAY ----------------
 async def main():
-    """Main function to run the bot"""
-    print("🚀 Starting AU Dating Bot...")
-    print(f"✅ Starting bot with token: {BOT_TOKEN[:10]}...")
-    print(f"✅ Database URL: {DATABASE_URL[:30]}...")
+    """Main function that will work perfectly on Railway"""
     
-    # Initialize database
+    # Initialize database FIRST
+    print("🔄 Initializing database...")
     try:
         await init_db()
         print("✅ Database initialized successfully!")
@@ -1957,16 +1893,29 @@ async def main():
         print(f"❌ Failed to initialize database: {e}")
         return
     
+    # Start health server BEFORE Telegram bot
+    print(f"🌐 Starting health server on port {PORT}...")
+    
+    async def handle_health(request):
+        return web.Response(text="Bot is healthy")
+    
+    health_app = web.Application()
+    health_app.router.add_get('/', handle_health)
+    health_app.router.add_get('/health', handle_health)
+    
+    runner = web.AppRunner(health_app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    print(f"✅ Health server running on http://0.0.0.0:{PORT}")
+    
     # Create Telegram application
-    print("🤖 Creating bot application...")
+    print("🤖 Creating Telegram bot application...")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Add all handlers (KEEP YOUR EXISTING HANDLER CODE)
-    # ================================================
-    # Add the conversation handler
+    # Add all handlers
+    print("🔧 Adding handlers...")
     app.add_handler(conv_handler)
-
-    # Add command handlers
     app.add_handler(CommandHandler("find", find_match))
     app.add_handler(CommandHandler("myprofile", show_my_profile))
     app.add_handler(CommandHandler("settings", set_preference))
@@ -1975,7 +1924,7 @@ async def main():
     app.add_handler(CommandHandler("requests", view_requests))
     app.add_handler(CommandHandler("admin", admin_panel))
 
-    # Add callback query handlers
+    # Callback query handlers
     app.add_handler(CallbackQueryHandler(handle_like, pattern="^(like_|report_)"))
     app.add_handler(CallbackQueryHandler(start_chat, pattern="^chat_"))
     app.add_handler(CallbackQueryHandler(find_match, pattern="find_next"))
@@ -1994,67 +1943,67 @@ async def main():
     app.add_handler(CallbackQueryHandler(admin_handle_report, pattern="^(approve_|reject_)"))
     app.add_handler(CallbackQueryHandler(handle_request_action, pattern="^(accept_|decline_|clear_requests)"))
 
-    # Add menu button handlers
+    # Menu button handlers
     app.add_handler(MessageHandler(filters.Regex("^🔥 Find Matches$"), find_match))
     app.add_handler(MessageHandler(filters.Regex("^👤 My Profile$"), show_my_profile))
     app.add_handler(MessageHandler(filters.Regex("^⚙️ Settings$"), set_preference))
     app.add_handler(MessageHandler(filters.Regex("^📢 Report User$"), report_user))
 
-    # Add message handlers
+    # Message handlers
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_relay))
     app.add_handler(MessageHandler(filters.PHOTO, photo_relay))
     
     # Admin broadcast handler
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.ALL, handle_broadcast_message))
-    # ================================================
-
-    print("✅ Bot setup complete!")
+    
+    print("✅ All handlers added!")
     print(f"👑 Admin User ID: {ADMIN_USER_ID if ADMIN_USER_ID else 'Not set'}")
     print(f"📢 Channel: {CHANNEL_USERNAME}")
     
-    # ========== SIMPLE HEALTH SERVER ==========
-    # Create health server FIRST
-    async def handle_health(request):
-        return web.Response(text="Bot is healthy")
-    
-    health_app = web.Application()
-    health_app.router.add_get('/', handle_health)
-    health_app.router.add_get('/health', handle_health)
-    
-    runner = web.AppRunner(health_app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    print(f"✅ Health check server running on port {PORT}")
-    
-    # Start Telegram bot polling
-    print("🤖 Starting bot polling...")
+    # Start the bot
+    print("🤖 Starting bot...")
     await app.initialize()
     await app.start()
+    
+    # Get bot info
+    bot_info = await app.bot.get_me()
+    print(f"✅ Bot info:")
+    print(f"   Name: {bot_info.first_name}")
+    print(f"   Username: @{bot_info.username}")
+    print(f"   ID: {bot_info.id}")
+    
+    # Start polling
+    print("🤖 Starting polling...")
     await app.updater.start_polling()
     
-    print("✅ AU Dating Bot is running on Railway!")
+    print("=" * 50)
+    print("🎉 AU DATING BOT IS RUNNING PERFECTLY!")
+    print("📱 Send /start to your bot on Telegram")
+    print("=" * 50)
     
-    # Keep the bot running
+    # Keep the bot running forever
+    # This is CRITICAL for Railway
     try:
-        # Create a simple keep-alive loop
-        while True:
-            await asyncio.sleep(1)
+        # Create a permanent event to keep the script alive
+        stop_event = asyncio.Event()
+        await stop_event.wait()  # This waits forever
     except KeyboardInterrupt:
-        print("\n👋 Shutting down...")
+        print("\n👋 Shutting down gracefully...")
+    except Exception as e:
+        print(f"❌ Unexpected error: {e}")
     finally:
         # Clean shutdown
         print("🔄 Cleaning up...")
-        await app.updater.stop()
         await app.stop()
         await app.shutdown()
         await runner.cleanup()
         print("✅ Shutdown complete!")
-        
 
-
-# ADD THIS AT THE END
+# Start the bot
 if __name__ == "__main__":
-    asyncio.run(main())
-
-
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        print(f"❌ Fatal error starting bot: {e}")
+        import traceback
+        traceback.print_exc()
