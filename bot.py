@@ -1947,16 +1947,12 @@ async def main():
     """Main function to run the bot"""
     print("🚀 Starting AU Dating Bot...")
     
-    # Start health server first
-    health_runner, health_site = await start_health_server()
-    
-    # Initialize database
+    # Initialize database first
     try:
         await init_db()
         print("✅ Database initialized successfully!")
     except Exception as e:
         print(f"❌ Failed to initialize database: {e}")
-        await health_runner.cleanup()
         return
     
     # Create application
@@ -2014,9 +2010,14 @@ async def main():
     # Start the bot
     await app.initialize()
     await app.start()
-    await app.updater.start_polling()
+    
+    # Start health server in background
+    health_task = asyncio.create_task(start_health_server())
     
     try:
+        # Start polling
+        await app.updater.start_polling()
+        
         # Keep running until interrupted
         while True:
             await asyncio.sleep(1)
@@ -2027,8 +2028,15 @@ async def main():
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
-        await health_runner.cleanup()
+        
+        # Cancel health server task
+        health_task.cancel()
+        try:
+            await health_task
+        except asyncio.CancelledError:
+            pass
 
 # ADD THIS AT THE END
 if __name__ == "__main__":
     asyncio.run(main())
+
