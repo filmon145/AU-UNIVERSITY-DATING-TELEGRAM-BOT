@@ -1946,8 +1946,10 @@ conv_handler = ConversationHandler(
 async def main():
     """Main function to run the bot"""
     print("🚀 Starting AU Dating Bot...")
+    print(f"✅ Starting bot with token: {BOT_TOKEN[:10]}...")
+    print(f"✅ Database URL: {DATABASE_URL[:30]}...")
     
-    # Initialize database first
+    # Initialize database
     try:
         await init_db()
         print("✅ Database initialized successfully!")
@@ -1955,10 +1957,12 @@ async def main():
         print(f"❌ Failed to initialize database: {e}")
         return
     
-    # Create application
+    # Create Telegram application
     print("🤖 Creating bot application...")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    # Add all handlers (KEEP YOUR EXISTING HANDLER CODE)
+    # ================================================
     # Add the conversation handler
     app.add_handler(conv_handler)
 
@@ -2002,41 +2006,55 @@ async def main():
     
     # Admin broadcast handler
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.ALL, handle_broadcast_message))
+    # ================================================
 
-    print("✅ AU Dating Bot is running on Railway! Press Ctrl+C to stop.")
+    print("✅ Bot setup complete!")
     print(f"👑 Admin User ID: {ADMIN_USER_ID if ADMIN_USER_ID else 'Not set'}")
     print(f"📢 Channel: {CHANNEL_USERNAME}")
     
-    # Start the bot
+    # ========== SIMPLE HEALTH SERVER ==========
+    # Create health server FIRST
+    async def handle_health(request):
+        return web.Response(text="Bot is healthy")
+    
+    health_app = web.Application()
+    health_app.router.add_get('/', handle_health)
+    health_app.router.add_get('/health', handle_health)
+    
+    runner = web.AppRunner(health_app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    print(f"✅ Health check server running on port {PORT}")
+    
+    # Start Telegram bot polling
+    print("🤖 Starting bot polling...")
     await app.initialize()
     await app.start()
+    await app.updater.start_polling()
     
-    # Start health server in background
-    health_task = asyncio.create_task(start_health_server())
+    print("✅ AU Dating Bot is running on Railway!")
     
+    # Keep the bot running
     try:
-        # Start polling
-        await app.updater.start_polling()
-        
-        # Keep running until interrupted
+        # Create a simple keep-alive loop
         while True:
             await asyncio.sleep(1)
     except KeyboardInterrupt:
         print("\n👋 Shutting down...")
     finally:
         # Clean shutdown
+        print("🔄 Cleaning up...")
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
+        await runner.cleanup()
+        print("✅ Shutdown complete!")
         
-        # Cancel health server task
-        health_task.cancel()
-        try:
-            await health_task
-        except asyncio.CancelledError:
-            pass
+
 
 # ADD THIS AT THE END
 if __name__ == "__main__":
     asyncio.run(main())
+
 
