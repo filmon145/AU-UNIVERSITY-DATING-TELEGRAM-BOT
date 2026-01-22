@@ -308,13 +308,21 @@ async def check_channel_membership(user_id: int, context: ContextTypes.DEFAULT_T
 
 async def update_channel_check(user_id: int, has_joined: bool):
     """Update channel check status in database"""
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO channel_checks (user_id, has_joined, last_checked) 
-            VALUES ($1, $2, NOW())
-            ON CONFLICT (user_id) DO UPDATE SET
-            has_joined = $2, last_checked = NOW()
-        """, (user_id, has_joined))
+    try:
+        async with db_pool.acquire() as conn:
+            # Ensure has_joined is a proper boolean
+            joined_bool = bool(has_joined)
+            
+            await conn.execute("""
+                INSERT INTO channel_checks (user_id, has_joined, last_checked) 
+                VALUES ($1, $2, NOW())
+                ON CONFLICT (user_id) 
+                DO UPDATE SET has_joined = EXCLUDED.has_joined, 
+                              last_checked = NOW()
+            """, user_id, joined_bool)
+    except Exception as e:
+        print(f"Error in update_channel_check for user {user_id}: {e}")
+        # Don't raise the error - just log it
 
 # ---------------- Start ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2161,6 +2169,7 @@ if __name__ == "__main__":
         print(f"❌ Fatal error starting bot: {e}")
         import traceback
         traceback.print_exc()
+
 
 
 
