@@ -310,10 +310,10 @@ async def update_channel_check(user_id: int, has_joined: bool):
     """Update channel check status in database"""
     async with db_pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO channel_checks (user_id, has_joined, checked_at) 
+            INSERT INTO channel_checks (user_id, has_joined, last_checked) 
             VALUES ($1, $2, NOW())
             ON CONFLICT (user_id) DO UPDATE SET
-            has_joined = $2, checked_at = NOW()
+            has_joined = $2, last_checked = NOW()
         """, (user_id, has_joined))
 
 # ---------------- Start ----------------
@@ -772,6 +772,11 @@ def get_main_menu():
 # ---------------- Chat System ----------------
 async def chat_relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Relay text messages between matched users"""
+    # Check if update.effective_user exists
+    if not update.effective_user:
+        print("Warning: update.effective_user is None in chat_relay")
+        return
+    
     user_id = update.effective_user.id
     
     if not update.message or not update.message.text:
@@ -805,6 +810,11 @@ async def chat_relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def photo_relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Relay photos between matched users in active chat"""
+    # Check if update.effective_user exists
+    if not update.effective_user:
+        print("Warning: update.effective_user is None in photo_relay")
+        return
+    
     user_id = update.effective_user.id
     
     # Check if user is in edit mode first
@@ -2151,5 +2161,6 @@ if __name__ == "__main__":
         print(f"❌ Fatal error starting bot: {e}")
         import traceback
         traceback.print_exc()
+
 
 
