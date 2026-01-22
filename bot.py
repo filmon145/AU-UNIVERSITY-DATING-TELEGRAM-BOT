@@ -226,39 +226,71 @@ async def save_profile(update, context):
     """Save user profile to PostgreSQL with better error handling"""
     user = update.effective_user
     if not user:
+        print("❌ No user in update")
         return False
     
     try:
         async with db_pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO users 
-                (telegram_id, username, name, gender, campus, photo_file_id, bio, hobbies, preference, updated_at) 
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
-                ON CONFLICT (telegram_id) DO UPDATE SET
-                username = EXCLUDED.username, 
-                name = EXCLUDED.name, 
-                gender = EXCLUDED.gender, 
-                campus = EXCLUDED.campus,
-                photo_file_id = EXCLUDED.photo_file_id, 
-                bio = EXCLUDED.bio, 
-                hobbies = EXCLUDED.hobbies, 
-                preference = EXCLUDED.preference,
-                updated_at = NOW()
-            """, (
-                user.id,
-                user.username,
-                context.user_data.get('name', ''),
-                context.user_data.get('gender', ''),
-                context.user_data.get('campus', ''),
-                context.user_data.get('photo_file_id'),
-                context.user_data.get('bio'),
-                context.user_data.get('hobbies'),
-                context.user_data.get('preference', 'Both')
-            ))
+            # First check if user exists
+            existing = await conn.fetchrow(
+                "SELECT telegram_id FROM users WHERE telegram_id = $1", 
+                user.id
+            )
+            
+            if existing:
+                # Update existing user
+                await conn.execute("""
+                    UPDATE users SET
+                    username = $1, 
+                    name = $2, 
+                    gender = $3, 
+                    campus = $4,
+                    photo_file_id = $5, 
+                    bio = $6, 
+                    hobbies = $7, 
+                    preference = $8,
+                    updated_at = NOW()
+                    WHERE telegram_id = $9
+                """, (
+                    user.username,
+                    context.user_data.get('name', ''),
+                    context.user_data.get('gender', ''),
+                    context.user_data.get('campus', ''),
+                    context.user_data.get('photo_file_id'),
+                    context.user_data.get('bio'),
+                    context.user_data.get('hobbies'),
+                    context.user_data.get('preference', 'Both'),
+                    user.id
+                ))
+                print(f"✅ Updated profile for user {user.id}")
+            else:
+                # Insert new user
+                await conn.execute("""
+                    INSERT INTO users 
+                    (telegram_id, username, name, gender, campus, photo_file_id, bio, hobbies, preference) 
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                """, (
+                    user.id,
+                    user.username,
+                    context.user_data.get('name', ''),
+                    context.user_data.get('gender', ''),
+                    context.user_data.get('campus', ''),
+                    context.user_data.get('photo_file_id'),
+                    context.user_data.get('bio'),
+                    context.user_data.get('hobbies'),
+                    context.user_data.get('preference', 'Both')
+                ))
+                print(f"✅ Created new profile for user {user.id}")
+            
+            # ✅ DEBUG: Check if user was saved
+            await debug_user_exists(user.id)
+            
             return True
             
     except Exception as e:
-        print(f"❌ Error saving profile for user {user.id}: {e}")
+        print(f"❌ Error saving profile for user {user.id}: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 async def get_user_by_telegram_id(user_id: int):
@@ -296,6 +328,53 @@ async def update_last_active(user_id: int):
             )
     except:
         pass  # Silently fail for this non-critical operation
+
+async def debug_user_exists(user_id: int):
+    """Debug function to check if user exists in database"""
+    try:
+        async with db_pool.acquire() as conn:
+            user = await conn.fetchrow(
+                "SELECT * FROM users WHERE telegram_id = $1", 
+                user_id
+            )
+            if user:
+                print(f"✅ DEBUG: User {user_id} exists in database:")
+                print(f"   Name: {user['name']}")
+                print(f"   Created: {user['created_at']}")
+                return True
+            else:
+                print(f"❌ DEBUG: User {user_id} NOT found in database")
+                return False
+    except Exception as e:
+        print(f"❌ DEBUG Error: {e}")
+        return False
+# Add this function right after the debug_user_exists function
+
+async def debug_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Debug command to check database"""
+    user_id = update.effective_user.id
+    
+    await update.message.reply_text(f"🔍 Checking database for user {user_id}...")
+    
+    async with db_pool.acquire() as conn:
+        # Check if user exists
+        user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", user_id)
+        if user:
+            await update.message.reply_text(
+                f"✅ User found in database:\n"
+                f"Name: {user['name']}\n"
+                f"Gender: {user['gender']}\n"
+                f"Campus: {user['campus']}\n"
+                f"Created: {user['created_at']}"
+            )
+        else:
+            await update.message.reply_text("❌ User NOT found in database")
+        
+        # Get total user count
+        count = await conn.fetchval("SELECT COUNT(*) FROM users")
+        await update.message.reply_text(f"📊 Total users in database: {count}")
+
+
 # ---------------- Channel Check ----------------
 async def check_channel_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Check if user is a member of the required channel"""
@@ -319,6 +398,11 @@ async def update_channel_check(user_id: int, has_joined: bool):
 # ---------------- Start ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    print(f"🔍 DEBUG: /start called by user {user_id}")
+    await debug_user_exists(user_id)
+    
+    # Clear any previous context data
+    context.user_data.clear()
     
     # Check if user is banned
     async with db_pool.acquire() as conn:
@@ -327,7 +411,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ You have been banned from using this bot.")
             return ConversationHandler.END
     
-    # Always check channel membership first
+    # Check channel membership
     has_joined = await check_channel_membership(user_id, context)
     await update_channel_check(user_id, has_joined)
     
@@ -355,7 +439,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
     
-    # User has joined channel, continue with normal flow
     # Check if user is already in a chat
     async with db_pool.acquire() as conn:
         chat_row = await conn.fetchrow("SELECT partner_id FROM active_chats WHERE user_id = $1", user_id)
@@ -363,18 +446,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ You are currently in a chat. Please use /stop to end your current conversation before starting a new registration.")
             return ConversationHandler.END
     
+    # Check if user already has a profile - FIXED QUERY
     async with db_pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT name FROM users WHERE telegram_id = $1", user_id)
+        user = await conn.fetchrow(
+            "SELECT name, telegram_id FROM users WHERE telegram_id = $1", 
+            user_id
+        )
     
     if user:
         await update.message.reply_text(
             f"Welcome back, {user['name']}! 🤗\n\n"
-            f"Use /find to meet people or /settings to change preferences.\n"
+            f"Use /find to meet people or /myprofile to view your profile.\n"
+            f"Use /settings to change preferences.\n"
             f"Use /report to report inappropriate behavior.",
             reply_markup=get_main_menu()
         )
         return ConversationHandler.END
     
+    # New user - start registration
     await update.message.reply_text(
         "<b>🎉 WELCOME TO AU DATING BOT!</b>\n\n"
         "Let's create your profile. First, what's your name or nickname?",
@@ -613,7 +702,10 @@ async def review_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if query.data == "confirm":
-        await save_profile(update, context)
+        success = await save_profile(update, context)  # ✅ Get the return value
+        
+        user_id = update.effective_user.id
+        print(f"🔍 DEBUG: Profile save {'successful' if success else 'failed'} for user {user_id}")
         
         if 'editing' in context.user_data:
             context.user_data.pop('editing', None)
@@ -623,15 +715,22 @@ async def review_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
         
-        welcome_text = (
-            "🎉 Registration Complete!\n\n"
-            "You can now use the menu buttons below to find people."
-        )
+        if success:
+            welcome_text = (
+                "🎉 Registration Complete!\n\n"
+                "You can now use the menu buttons below to find people."
+            )
+        else:
+            welcome_text = (
+                "❌ Failed to save your profile. Please try again or contact support."
+            )
+        
         await query.message.reply_text(
             text=welcome_text, 
             reply_markup=get_main_menu()
         )
         return ConversationHandler.END
+    # ... rest of your code
 
     elif query.data == "edit_profile":
         context.user_data['editing'] = True
@@ -2078,6 +2177,8 @@ async def main():
     app.add_handler(CommandHandler("requests", view_requests))
     app.add_handler(CommandHandler("admin", admin_panel))
 
+    app.add_handler(CommandHandler("debug", debug_db))
+
     # Callback query handlers
     app.add_handler(CallbackQueryHandler(handle_like, pattern="^(like_|report_)"))
     app.add_handler(CallbackQueryHandler(start_chat, pattern="^chat_"))
@@ -2161,6 +2262,7 @@ if __name__ == "__main__":
         print(f"❌ Fatal error starting bot: {e}")
         import traceback
         traceback.print_exc()
+
 
 
 
