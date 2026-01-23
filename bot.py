@@ -224,17 +224,30 @@ async def create_tables():
 
 async def save_profile(update, context):
     """Save user profile to PostgreSQL with better error handling"""
-    user = update.effective_user
-    if not user:
-        print("❌ No user in update")
-        return False
-    
     try:
+        user = update.effective_user
+        if not user:
+            print("❌ No user in update")
+            return False
+        
         async with db_pool.acquire() as conn:
+            # Get all values with explicit defaults
+            user_id = user.id
+            username = user.username or ""
+            name = context.user_data.get('name') or "Unknown"
+            gender = context.user_data.get('gender') or "Unknown"
+            campus = context.user_data.get('campus') or "Unknown"
+            photo_file_id = context.user_data.get('photo_file_id')
+            bio = context.user_data.get('bio')
+            hobbies = context.user_data.get('hobbies')
+            preference = context.user_data.get('preference') or "Both"
+            
+            print(f"DEBUG: Saving profile for {user_id}, name: {name}")
+            
             # First check if user exists
             existing = await conn.fetchrow(
                 "SELECT telegram_id FROM users WHERE telegram_id = $1", 
-                user.id
+                user_id
             )
             
             if existing:
@@ -251,48 +264,42 @@ async def save_profile(update, context):
                     preference = $8,
                     updated_at = NOW()
                     WHERE telegram_id = $9
-                """, (
-                    user.username,
-                    context.user_data.get('name', ''),
-                    context.user_data.get('gender', ''),
-                    context.user_data.get('campus', ''),
-                    context.user_data.get('photo_file_id'),
-                    context.user_data.get('bio'),
-                    context.user_data.get('hobbies'),
-                    context.user_data.get('preference', 'Both'),
-                    user.id
-                ))
-                print(f"✅ Updated profile for user {user.id}")
+                """, 
+                username, name, gender, campus, photo_file_id, 
+                bio, hobbies, preference, user_id
+                )
+                print(f"✅ Updated profile for user {user_id}")
             else:
-                # Insert new user
+                # Insert new user - FIXED
                 await conn.execute("""
                     INSERT INTO users 
-                    (telegram_id, username, name, gender, campus, photo_file_id, bio, hobbies, preference) 
+                    (telegram_id, username, name, gender, campus, 
+                     photo_file_id, bio, hobbies, preference) 
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                """, (
-                    user.id,
-                    user.username,
-                    context.user_data.get('name', ''),
-                    context.user_data.get('gender', ''),
-                    context.user_data.get('campus', ''),
-                    context.user_data.get('photo_file_id'),
-                    context.user_data.get('bio'),
-                    context.user_data.get('hobbies'),
-                    context.user_data.get('preference', 'Both')
-                ))
-                print(f"✅ Created new profile for user {user.id}")
+                """, 
+                user_id, username, name, gender, campus, 
+                photo_file_id, bio, hobbies, preference
+                )
+                print(f"✅ Created new profile for user {user_id}")
             
             # ✅ DEBUG: Check if user was saved
-            await debug_user_exists(user.id)
+            await debug_user_exists(user_id)
             
             return True
             
     except Exception as e:
-        print(f"❌ Error saving profile for user {user.id}: {type(e).__name__}: {e}")
+        # Get user ID safely
+        user_id = "unknown"
+        try:
+            if 'user' in locals() and user:
+                user_id = user.id
+        except:
+            pass
+        
+        print(f"❌ Error saving profile for user {user_id}: {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
         return False
-
 async def get_user_by_telegram_id(user_id: int):
     """Get user by Telegram ID"""
     try:
@@ -2262,6 +2269,7 @@ if __name__ == "__main__":
         print(f"❌ Fatal error starting bot: {e}")
         import traceback
         traceback.print_exc()
+
 
 
 
