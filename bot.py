@@ -3091,11 +3091,6 @@ async def main():
     web_app.router.add_get('/health', handle_health)
     web_app.router.add_get('/test', handle_test)
     
-    # Verify all endpoints are registered
-    print("📋 Registered routes:")
-    for route in web_app.router.routes():
-        print(f"   {route.method} {route.path}")
-    
     # Start the web server
     runner = web.AppRunner(web_app)
     await runner.setup()
@@ -3144,6 +3139,7 @@ if __name__ == "__main__":
         print(f"❌ Fatal error starting bot: {e}")
         import traceback
         traceback.print_exc()
+
 
 
 
