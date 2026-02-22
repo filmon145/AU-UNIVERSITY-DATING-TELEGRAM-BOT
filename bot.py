@@ -2862,9 +2862,9 @@ conv_handler = ConversationHandler(
     per_message=False
 )
 
-# ---------------- MAIN FUNCTION ----------------
+# ---------------- MAIN FUNCTION - WEBHOOK VERSION ----------------
 async def main():
-    """Main function that will work perfectly on Railway"""
+    """Main function using webhook (recommended for Render)"""
     
     # Initialize database FIRST
     print("🔄 Initializing database...")
@@ -2875,27 +2875,23 @@ async def main():
         print(f"❌ Failed to initialize database: {e}")
         return
     
-    # Start health server BEFORE Telegram bot
-    print(f"🌐 Starting health server on port {PORT}...")
+    # Get Render URL from environment
+    RENDER_URL = os.getenv("RENDER_URL")
+    if not RENDER_URL:
+        print("❌ ERROR: RENDER_URL environment variable is required for webhook mode!")
+        print("Please add it in Render dashboard: https://au-university-dating-telegram-bot.onrender.com")
+        return
     
-    async def handle_health(request):
-        return web.Response(text="Bot is healthy")
+    WEBHOOK_PATH = "/webhook"
+    WEBHOOK_URL = f"{RENDER_URL}{WEBHOOK_PATH}"
     
-    health_app = web.Application()
-    health_app.router.add_get('/', handle_health)
-    health_app.router.add_get('/health', handle_health)
-    
-    runner = web.AppRunner(health_app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    print(f"✅ Health server running on http://0.0.0.0:{PORT}")
+    print(f"🌐 Setting up webhook on {WEBHOOK_URL}")
     
     # Create Telegram application
     print("🤖 Creating Telegram bot application...")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Add all handlers
+    # Add all handlers (keep ALL your existing handlers here)
     print("🔧 Adding handlers...")
     
     # Conversation handler for registration
@@ -2986,10 +2982,60 @@ async def main():
     print(f"👑 Admin User ID: {ADMIN_USER_ID if ADMIN_USER_ID else 'Not set'}")
     print(f"📢 Channel: {CHANNEL_USERNAME}")
     
-    # Start the bot
-    print("🤖 Starting bot...")
-    await app.initialize()
-    await app.start()
+    # Set up webhook
+    print("🔧 Setting webhook...")
+    
+    # Delete any existing webhook first
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    
+    # Set the new webhook
+    await app.bot.set_webhook(
+        url=WEBHOOK_URL,
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        max_connections=40  # Optimal for performance
+    )
+    
+    print(f"✅ Webhook set to: {WEBHOOK_URL}")
+    
+    # Start webhook server
+    print(f"🌐 Starting webhook server on port {PORT}...")
+    
+    # Create aiohttp web application
+    web_app = web.Application()
+    
+    # Health check endpoint
+    async def handle_health(request):
+        return web.Response(text="Bot is healthy")
+    
+    # Webhook endpoint
+    async def handle_webhook(request):
+        """Handle incoming updates from Telegram"""
+        try:
+            # Parse the incoming update
+            update_data = await request.json()
+            update = Update.de_json(update_data, app.bot)
+            
+            # Process the update
+            await app.process_update(update)
+            
+            return web.Response(status=200, text="OK")
+        except Exception as e:
+            print(f"❌ Error processing webhook: {e}")
+            return web.Response(status=500, text="Error")
+    
+    # Add routes
+    web_app.router.add_post(WEBHOOK_PATH, handle_webhook)
+    web_app.router.add_get('/', handle_health)
+    web_app.router.add_get('/health', handle_health)
+    
+    # Start the web server
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    
+    print(f"✅ Webhook server running on port {PORT}")
     
     # Get bot info
     bot_info = await app.bot.get_me()
@@ -2998,35 +3044,16 @@ async def main():
     print(f"   Username: @{bot_info.username}")
     print(f"   ID: {bot_info.id}")
     
-    # Start polling
-    print("🤖 Starting polling...")
-    await app.updater.start_polling()
-    
     print("=" * 50)
-    print("🎉 AU DATING BOT IS RUNNING PERFECTLY!")
-    print("📱 Send /start to your bot on Telegram")
+    print("🎉 AU DATING BOT IS RUNNING WITH WEBHOOK!")
+    print(f"📱 Webhook URL: {WEBHOOK_URL}")
+    print(f"💡 Health check: {RENDER_URL}/health")
     print("=" * 50)
     
-    # Self-ping function to keep Render free tier awake
-    async def self_ping():
-        """Ping self to keep Render free tier awake"""
-        while True:
-            await asyncio.sleep(240)  # 4 minutes
-            try:
-                async with aiohttp.ClientSession() as session:
-                    await session.get(f"https://au-university-dating-telegram-bot.onrender.com/health")
-                    print("🔄 Self-ping to keep alive")
-            except:
-                pass
-    
-    # Start self-ping task
-    asyncio.create_task(self_ping())
-    
-    # Keep the bot running forever
+    # Keep the bot running
     try:
-        # Create a permanent event to keep the script alive
-        stop_event = asyncio.Event()
-        await stop_event.wait()  # This waits forever
+        # Keep the script alive
+        await asyncio.Event().wait()
     except KeyboardInterrupt:
         print("\n👋 Shutting down gracefully...")
     except Exception as e:
@@ -3034,6 +3061,7 @@ async def main():
     finally:
         # Clean shutdown
         print("🔄 Cleaning up...")
+        await app.bot.delete_webhook()
         await app.stop()
         await app.shutdown()
         await runner.cleanup()
@@ -3047,6 +3075,7 @@ if __name__ == "__main__":
         print(f"❌ Fatal error starting bot: {e}")
         import traceback
         traceback.print_exc()
+
 
 
 
