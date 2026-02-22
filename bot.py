@@ -1117,15 +1117,24 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         pref = row['preference']
 
-        # Don't show banned users
+        # Don't show:
+        # - Banned users
+        # - Users already liked
+        # - Users currently in active chats
         if pref == "Both":
             query = """
-            SELECT telegram_id, name, gender, campus, bio, photo_file_id
-            FROM users
-            WHERE gender IN ('Male', 'Female') AND is_banned = FALSE
-            AND telegram_id != $1
-            AND telegram_id NOT IN (
+            SELECT u.telegram_id, u.name, u.gender, u.campus, u.bio, u.photo_file_id
+            FROM users u
+            WHERE u.gender IN ('Male', 'Female') 
+            AND u.is_banned = FALSE
+            AND u.telegram_id != $1
+            AND u.telegram_id NOT IN (
                 SELECT liked_id FROM swipes WHERE liker_id = $1
+            )
+            AND u.telegram_id NOT IN (
+                SELECT user_id FROM active_chats 
+                UNION 
+                SELECT partner_id FROM active_chats
             )
             ORDER BY RANDOM()
             LIMIT 1
@@ -1133,12 +1142,18 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
             params = (user_id,)
         else:
             query = """
-            SELECT telegram_id, name, gender, campus, bio, photo_file_id
-            FROM users
-            WHERE gender = $1 AND is_banned = FALSE
-            AND telegram_id != $2
-            AND telegram_id NOT IN (
+            SELECT u.telegram_id, u.name, u.gender, u.campus, u.bio, u.photo_file_id
+            FROM users u
+            WHERE u.gender = $1 
+            AND u.is_banned = FALSE
+            AND u.telegram_id != $2
+            AND u.telegram_id NOT IN (
                 SELECT liked_id FROM swipes WHERE liker_id = $2
+            )
+            AND u.telegram_id NOT IN (
+                SELECT user_id FROM active_chats 
+                UNION 
+                SELECT partner_id FROM active_chats
             )
             ORDER BY RANDOM()
             LIMIT 1
@@ -1160,7 +1175,7 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     match_id = match['telegram_id']
     name = match['name']
-    gender = match['gender']  # Get gender from database
+    gender = match['gender']
     campus = match['campus']
     bio = match['bio']
     photo = match['photo_file_id']
@@ -1253,11 +1268,31 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
     liked_id = int(query.data.split('_')[1]) 
 
     async with db_pool.acquire() as conn:
+        # Insert the like
         await conn.execute("INSERT INTO swipes (liker_id, liked_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", user_id, liked_id)
 
+        # Check if it's a match (the liked user already liked the current user)
         is_match = await conn.fetchrow("SELECT 1 FROM swipes WHERE liker_id = $1 AND liked_id = $2", liked_id, user_id)
+
+        # Get current user's info for notifications
         me = await conn.fetchrow("SELECT name, gender, photo_file_id FROM users WHERE telegram_id = $1", user_id)
+        
+        # Get liked user's info
+        liked_user = await conn.fetchrow("SELECT name FROM users WHERE telegram_id = $1", liked_id)
+        liked_name = liked_user['name'] if liked_user else "someone"
+
+    # Send confirmation to the liker that their like was sent
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"✅ You liked <b>{liked_name}</b>! We'll notify you if they like you back.",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        print(f"Failed to send like confirmation: {e}")
+
     if is_match:
+        # IT'S A MATCH! 🎉
         match_alert = "<b>🎆 BOOM! IT'S A MATCH! 🎆</b>\n\nYou both liked each other! Don't wait, say hi! 👋"
         
         # Check if the matched user is in a chat
@@ -1268,6 +1303,7 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text("🎯 You have a match! However, your match is currently in another conversation. Try again later!")
                 return await find_match(update, context)
         
+        # Notify the liked user about the match
         await context.bot.send_message(
             chat_id=liked_id, 
             text=f"{match_alert}\n\nMatched with: {me['name']}",
@@ -1275,20 +1311,21 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💬 Send Message", callback_data=f"chat_{user_id}")]])
         )
         
+        # Notify the current user about the match
         await query.message.reply_text(
             text=match_alert,
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💬 Start Chatting", callback_data=f"chat_{liked_id}")]])
         )
     else:
+        # Not a match yet - just update the current message and notify the liked user
         await query.edit_message_caption(caption="⚡ Like sent! Looking for more...")
         
+        # Send notification to the liked user that someone liked them
         try:
-            # Inside handle_like function, find this section:
-try:
-
-    gender_emoji = "👨" if me['gender'] == "Male" else "👩" if me['gender'] == "Female" else "⚧"
-    caption = f"<b>🔥 SOMEONE LIKED YOU!</b>\n\n{gender_emoji} <b>{me['name']}</b> just swiped right. Swipe /find to see who it is!"
+            gender_emoji = "👨" if me['gender'] == "Male" else "👩" if me['gender'] == "Female" else "⚧"
+            caption = f"<b>🔥 SOMEONE LIKED YOU!</b>\n\n{gender_emoji} <b>{me['name']}</b> just swiped right on your profile. Swipe /find to see who it is!"
+            
             if me['photo_file_id']:
                 await context.bot.send_photo(
                     chat_id=liked_id, 
@@ -1304,57 +1341,11 @@ try:
                     parse_mode="HTML",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💖 Like Back", callback_data=f"like_{user_id}")]])
                 )
-        except: 
-            pass
+        except Exception as e:
+            print(f"Failed to send like notification to {liked_id}: {e}")
 
+    # Continue showing more profiles
     return await find_match(update, context)
-
-async def show_my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    
-    async with db_pool.acquire() as conn:
-        user = await conn.fetchrow(
-            "SELECT name, gender, campus, bio, hobbies, photo_file_id FROM users WHERE telegram_id = $1", 
-            user_id
-        )
-
-    if not user:
-        await update.message.reply_text("❌ You don't have a profile yet! Type /start.")
-        return
-
-    name = user['name']
-    gender = user['gender']
-    campus = user['campus']
-    bio = user['bio']
-    hobbies = user['hobbies']
-    photo_id = user['photo_file_id']
-    
-    profile_text = (
-        "<b>👤 YOUR PROFILE</b>\n\n"
-        f"<b>✨ Name:</b> {name}\n"
-        f"<b>⚧ Gender:</b> {gender}\n"
-        f"<b>📍 Campus:</b> {campus}\n"
-        f"<b>📝 Bio:</b> {bio or 'Not set'}\n"
-        f"<b>🎯 Hobbies:</b> {hobbies or 'Not set'}"
-    )
-
-    keyboard = [[InlineKeyboardButton("Edit Profile ✏️", callback_data="start_edit_profile")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    if photo_id:
-        await update.message.reply_photo(
-            photo=photo_id, 
-            caption=profile_text,
-            parse_mode="HTML",
-            reply_markup=reply_markup
-        )
-    else:
-        await update.message.reply_text(
-            profile_text,
-            parse_mode="HTML",
-            reply_markup=reply_markup
-        )
-
 # ---------------- Edit Profile System ----------------
 async def start_edit_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start editing profile from existing profile view"""
@@ -3412,6 +3403,7 @@ if __name__ == "__main__":
         print(f"❌ Fatal error starting bot: {e}")
         import traceback
         traceback.print_exc()
+
 
 
 
