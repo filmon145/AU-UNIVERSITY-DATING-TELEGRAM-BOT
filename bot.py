@@ -2,6 +2,7 @@ import sys
 import os
 import asyncio
 import asyncpg
+import aiohttp  
 import logging
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
@@ -1652,8 +1653,663 @@ async def finish_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
+# ---------------- Enhanced Admin Functions ----------------
 
-# ---------------- Admin Panel ----------------
+async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show user management panel"""
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [
+        [InlineKeyboardButton("📋 All Users", callback_data="admin_list_users")],
+        [InlineKeyboardButton("🔍 Search User", callback_data="admin_search_user")],
+        [InlineKeyboardButton("🚫 Banned Users", callback_data="admin_banned_users")],
+        [InlineKeyboardButton("📊 Statistics", callback_data="admin_stats")],
+        [InlineKeyboardButton("🔙 Back", callback_data="admin_back")]
+    ]
+    
+    await query.edit_message_text(
+        "<b>👥 USER MANAGEMENT</b>\n\n"
+        "Select an option below:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def admin_list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all users with pagination"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Get page number from callback or default to 1
+    page = int(context.user_data.get('admin_user_page', 1))
+    users_per_page = 5
+    
+    async with db_pool.acquire() as conn:
+        # Get total count
+        total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+        
+        # Get users for current page
+        offset = (page - 1) * users_per_page
+        users = await conn.fetch("""
+            SELECT telegram_id, username, name, gender, campus, is_banned, created_at
+            FROM users 
+            ORDER BY created_at DESC
+            LIMIT $1 OFFSET $2
+        """, users_per_page, offset)
+    
+    if not users:
+        await query.edit_message_text(
+            "📭 No users found.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_users")]])
+        )
+        return
+    
+    # Build message
+    text = f"<b>📋 USERS (Page {page}/{max(1, (total_users + users_per_page - 1) // users_per_page)})</b>\n\n"
+    
+    keyboard = []
+    for user in users:
+        status = "🔴 BANNED" if user['is_banned'] else "🟢 ACTIVE"
+        username_display = f"@{user['username']}" if user['username'] else "No username"
+        
+        text += f"<b>ID:</b> <code>{user['telegram_id']}</code>\n"
+        text += f"<b>Name:</b> {user['name']}\n"
+        text += f"<b>Username:</b> {username_display}\n"
+        text += f"<b>Gender:</b> {user['gender']}\n"
+        text += f"<b>Campus:</b> {user['campus']}\n"
+        text += f"<b>Status:</b> {status}\n"
+        text += f"<b>Joined:</b> {user['created_at'].strftime('%Y-%m-%d')}\n"
+        text += "─" * 30 + "\n"
+        
+        # Add action buttons for each user
+        keyboard.append([
+            InlineKeyboardButton(f"👤 {user['name']}", callback_data=f"admin_view_user_{user['telegram_id']}")
+        ])
+    
+    # Pagination buttons
+    nav_buttons = []
+    if page > 1:
+        nav_buttons.append(InlineKeyboardButton("◀️ Prev", callback_data=f"admin_users_page_{page-1}"))
+    if offset + users_per_page < total_users:
+        nav_buttons.append(InlineKeyboardButton("Next ▶️", callback_data=f"admin_users_page_{page+1}"))
+    
+    if nav_buttons:
+        keyboard.append(nav_buttons)
+    
+    keyboard.append([InlineKeyboardButton("🔙 Back to User Mgmt", callback_data="admin_users")])
+    keyboard.append([InlineKeyboardButton("🏠 Main Admin", callback_data="admin_back")])
+    
+    await query.edit_message_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def admin_users_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle user list pagination"""
+    query = update.callback_query
+    await query.answer()
+    
+    page = int(query.data.split('_')[-1])
+    context.user_data['admin_user_page'] = page
+    
+    # Call list users again
+    await admin_list_users(update, context)
+
+async def admin_view_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """View detailed user information"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = int(query.data.split('_')[-1])
+    
+    async with db_pool.acquire() as conn:
+        # Get user details
+        user = await conn.fetchrow("""
+            SELECT * FROM users WHERE telegram_id = $1
+        """, user_id)
+        
+        if not user:
+            await query.edit_message_text("❌ User not found.")
+            return
+        
+        # Get user stats
+        likes_given = await conn.fetchval("SELECT COUNT(*) FROM swipes WHERE liker_id = $1", user_id)
+        likes_received = await conn.fetchval("SELECT COUNT(*) FROM swipes WHERE liked_id = $1", user_id)
+        
+        # Get matches
+        matches = await conn.fetchval("""
+            SELECT COUNT(*) FROM (
+                SELECT s1.liker_id, s1.liked_id 
+                FROM swipes s1
+                INNER JOIN swipes s2 ON s1.liker_id = s2.liked_id AND s1.liked_id = s2.liker_id
+                WHERE s1.liker_id = $1 OR s1.liked_id = $1
+            ) as matches
+        """, user_id)
+        
+        # Get reports
+        reports_made = await conn.fetchval("SELECT COUNT(*) FROM reports WHERE reporter_id = $1", user_id)
+        reports_received = await conn.fetchval("SELECT COUNT(*) FROM reports WHERE reported_id = $1 AND status = 'pending'", user_id)
+        
+        # Check if currently in chat
+        in_chat = await conn.fetchrow("SELECT partner_id FROM active_chats WHERE user_id = $1", user_id)
+    
+    # Build detailed profile
+    username_display = f"@{user['username']}" if user['username'] else "No username"
+    status = "🔴 BANNED" if user['is_banned'] else "🟢 ACTIVE"
+    chat_status = "💬 In chat" if in_chat else "💤 Not in chat"
+    
+    profile_text = (
+        f"<b>👤 USER DETAILS</b>\n\n"
+        f"<b>🆔 Telegram ID:</b> <code>{user['telegram_id']}</code>\n"
+        f"<b>📛 Username:</b> {username_display}\n"
+        f"<b>✨ Name:</b> {user['name']}\n"
+        f"<b>⚧ Gender:</b> {user['gender']}\n"
+        f"<b>📍 Campus:</b> {user['campus']}\n"
+        f"<b>📝 Bio:</b> {user['bio'] or 'Not set'}\n"
+        f"<b>🎯 Hobbies:</b> {user['hobbies'] or 'Not set'}\n"
+        f"<b>🎯 Preference:</b> {user['preference']}\n"
+        f"<b>📊 Status:</b> {status}\n"
+        f"<b>💬 Chat:</b> {chat_status}\n\n"
+        f"<b>📈 STATISTICS</b>\n"
+        f"<b>❤️ Likes Given:</b> {likes_given}\n"
+        f"<b>💖 Likes Received:</b> {likes_received}\n"
+        f"<b>💕 Total Matches:</b> {matches}\n"
+        f"<b>📝 Reports Made:</b> {reports_made}\n"
+        f"<b>⚠️ Reports Received:</b> {reports_received}\n\n"
+        f"<b>📅 Joined:</b> {user['created_at'].strftime('%Y-%m-%d %H:%M')}\n"
+        f"<b>🕒 Last Active:</b> {user['last_active'].strftime('%Y-%m-%d %H:%M') if user['last_active'] else 'Never'}"
+    )
+    
+    # Action buttons
+    keyboard = []
+    
+    if user['is_banned']:
+        keyboard.append([InlineKeyboardButton("✅ Unban User", callback_data=f"admin_unban_{user['telegram_id']}")])
+    else:
+        keyboard.append([InlineKeyboardButton("🔴 Ban User", callback_data=f"admin_ban_{user['telegram_id']}")])
+    
+    keyboard.append([InlineKeyboardButton("📨 Send Message", callback_data=f"admin_message_{user['telegram_id']}")])
+    keyboard.append([InlineKeyboardButton("📊 View Swipes", callback_data=f"admin_swipes_{user['telegram_id']}")])
+    keyboard.append([InlineKeyboardButton("🔙 Back to Users", callback_data="admin_list_users")])
+    keyboard.append([InlineKeyboardButton("🏠 Main Admin", callback_data="admin_back")])
+    
+    # Send user photo if exists
+    try:
+        if user['photo_file_id']:
+            await query.message.delete()
+            await context.bot.send_photo(
+                chat_id=query.from_user.id,
+                photo=user['photo_file_id'],
+                caption=profile_text,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            await query.edit_message_text(
+                profile_text,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+    except:
+        await query.edit_message_text(
+            profile_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+async def admin_ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ban a user"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = int(query.data.split('_')[-1])
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE users SET is_banned = TRUE WHERE telegram_id = $1", user_id)
+        
+        # Get user info for logging
+        user = await conn.fetchrow("SELECT name FROM users WHERE telegram_id = $1", user_id)
+    
+    # Notify user
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="<b>❌ ACCOUNT BANNED</b>\n\nYour account has been banned by an administrator. If you believe this is a mistake, please contact support.",
+            parse_mode="HTML"
+        )
+    except:
+        pass
+    
+    await query.edit_message_text(
+        f"✅ User {user['name']} ({user_id}) has been banned.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_list_users")]])
+    )
+
+async def admin_unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Unban a user"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = int(query.data.split('_')[-1])
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE users SET is_banned = FALSE WHERE telegram_id = $1", user_id)
+        
+        # Get user info for logging
+        user = await conn.fetchrow("SELECT name FROM users WHERE telegram_id = $1", user_id)
+    
+    # Notify user
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="<b>✅ ACCOUNT UNBANNED</b>\n\nYour account has been unbanned. You can now use the bot again.",
+            parse_mode="HTML"
+        )
+    except:
+        pass
+    
+    await query.edit_message_text(
+        f"✅ User {user['name']} ({user_id}) has been unbanned.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_list_users")]])
+    )
+
+async def admin_banned_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all banned users"""
+    query = update.callback_query
+    await query.answer()
+    
+    async with db_pool.acquire() as conn:
+        users = await conn.fetch("""
+            SELECT telegram_id, name, username, created_at 
+            FROM users 
+            WHERE is_banned = TRUE
+            ORDER BY updated_at DESC
+        """)
+    
+    if not users:
+        await query.edit_message_text(
+            "✅ No banned users.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_users")]])
+        )
+        return
+    
+    text = "<b>🚫 BANNED USERS</b>\n\n"
+    keyboard = []
+    
+    for user in users:
+        username_display = f"(@{user['username']})" if user['username'] else ""
+        text += f"<b>👤 {user['name']}</b> {username_display}\n"
+        text += f"<b>ID:</b> <code>{user['telegram_id']}</code>\n"
+        text += f"<b>Banned since:</b> {user['created_at'].strftime('%Y-%m-%d')}\n"
+        text += "─" * 30 + "\n"
+        
+        keyboard.append([InlineKeyboardButton(f"✅ Unban {user['name']}", callback_data=f"admin_unban_{user['telegram_id']}")])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin_users")])
+    
+    await query.edit_message_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def admin_search_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start user search"""
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data['admin_searching'] = True
+    
+    await query.edit_message_text(
+        "<b>🔍 SEARCH USER</b>\n\n"
+        "Send me the Telegram ID, username, or name of the user you want to search for.\n\n"
+        "Type /cancel to cancel.",
+        parse_mode="HTML"
+    )
+
+async def admin_handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle user search query"""
+    if 'admin_searching' not in context.user_data:
+        return
+    
+    user_id = update.effective_user.id
+    if user_id != ADMIN_USER_ID:
+        return
+    
+    search_term = update.message.text.strip()
+    
+    # Cancel search
+    if search_term.startswith('/cancel'):
+        context.user_data.pop('admin_searching', None)
+        await update.message.reply_text("Search cancelled.")
+        return
+    
+    async with db_pool.acquire() as conn:
+        # Try to search by telegram_id (exact match)
+        try:
+            telegram_id = int(search_term)
+            users = await conn.fetch("SELECT * FROM users WHERE telegram_id = $1", telegram_id)
+        except ValueError:
+            # Search by username or name
+            users = await conn.fetch("""
+                SELECT * FROM users 
+                WHERE username ILIKE $1 OR name ILIKE $1
+                ORDER BY created_at DESC
+                LIMIT 10
+            """, f"%{search_term}%")
+    
+    if not users:
+        await update.message.reply_text("❌ No users found matching your search.")
+        return
+    
+    # Show search results
+    text = f"<b>🔍 SEARCH RESULTS for '{search_term}'</b>\n\n"
+    keyboard = []
+    
+    for user in users:
+        status = "🔴 BANNED" if user['is_banned'] else "🟢 ACTIVE"
+        username_display = f"@{user['username']}" if user['username'] else "No username"
+        
+        text += f"<b>👤 {user['name']}</b>\n"
+        text += f"<b>ID:</b> <code>{user['telegram_id']}</code>\n"
+        text += f"<b>Username:</b> {username_display}\n"
+        text += f"<b>Status:</b> {status}\n"
+        text += "─" * 30 + "\n"
+        
+        keyboard.append([InlineKeyboardButton(f"View {user['name']}", callback_data=f"admin_view_user_{user['telegram_id']}")])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin_users")])
+    
+    await update.message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    
+    context.user_data.pop('admin_searching', None)
+
+# ---------------- Enhanced Broadcast System ----------------
+
+# Broadcast states
+BROADCAST_TEXT, BROADCAST_MEDIA = range(2)
+
+async def admin_broadcast_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show broadcast options"""
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [
+        [InlineKeyboardButton("📝 Text Only", callback_data="broadcast_text")],
+        [InlineKeyboardButton("🖼️ Photo + Caption", callback_data="broadcast_photo")],
+        [InlineKeyboardButton("🎥 Video + Caption", callback_data="broadcast_video")],
+        [InlineKeyboardButton("📎 Document + Caption", callback_data="broadcast_document")],
+        [InlineKeyboardButton("🔙 Back", callback_data="admin_back")]
+    ]
+    
+    await query.edit_message_text(
+        "<b>📢 BROADCAST MENU</b>\n\n"
+        "Choose what type of content you want to broadcast to all users:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start broadcast process based on type"""
+    query = update.callback_query
+    await query.answer()
+    
+    broadcast_type = query.data.replace("broadcast_", "")
+    context.user_data['broadcast_type'] = broadcast_type
+    
+    messages = {
+        "text": "📝 Send the text message you want to broadcast:",
+        "photo": "🖼️ Send the photo you want to broadcast (as a photo, not file):",
+        "video": "🎥 Send the video you want to broadcast:",
+        "document": "📎 Send the document you want to broadcast:"
+    }
+    
+    await query.edit_message_text(
+        f"<b>📢 BROADCAST</b>\n\n{messages[broadcast_type]}\n\nType /cancel to cancel.",
+        parse_mode="HTML"
+    )
+    
+    return BROADCAST_MEDIA if broadcast_type != "text" else BROADCAST_TEXT
+
+async def broadcast_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive and process text broadcast"""
+    if 'broadcast_type' not in context.user_data:
+        return ConversationHandler.END
+    
+    broadcast_type = context.user_data['broadcast_type']
+    text = update.message.text
+    
+    # Cancel if requested
+    if text.startswith('/cancel'):
+        context.user_data.clear()
+        await update.message.reply_text("Broadcast cancelled.")
+        return ConversationHandler.END
+    
+    # Get confirmation
+    context.user_data['broadcast_text'] = text
+    
+    # Show preview
+    preview_text = f"<b>📢 BROADCAST PREVIEW</b>\n\n{text}"
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ Send to All Users", callback_data="broadcast_confirm")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="broadcast_cancel")]
+    ]
+    
+    await update.message.reply_text(
+        preview_text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    
+    return ConversationHandler.END
+
+async def broadcast_receive_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive and process media broadcast"""
+    if 'broadcast_type' not in context.user_data:
+        return ConversationHandler.END
+    
+    broadcast_type = context.user_data['broadcast_type']
+    
+    # Store media info
+    if broadcast_type == "photo" and update.message.photo:
+        context.user_data['broadcast_media'] = update.message.photo[-1].file_id
+        context.user_data['broadcast_caption'] = update.message.caption or ""
+    elif broadcast_type == "video" and update.message.video:
+        context.user_data['broadcast_media'] = update.message.video.file_id
+        context.user_data['broadcast_caption'] = update.message.caption or ""
+    elif broadcast_type == "document" and update.message.document:
+        context.user_data['broadcast_media'] = update.message.document.file_id
+        context.user_data['broadcast_caption'] = update.message.caption or ""
+    else:
+        await update.message.reply_text(f"❌ Please send a valid {broadcast_type}.")
+        return BROADCAST_MEDIA
+    
+    # Ask for caption if not provided
+    if not context.user_data.get('broadcast_caption') and broadcast_type != "text":
+        await update.message.reply_text(
+            "📝 Now send the caption for your media (or send /skip to send without caption):"
+        )
+        return BROADCAST_TEXT
+    
+    # Show preview
+    await show_broadcast_preview(update, context)
+    return ConversationHandler.END
+
+async def broadcast_receive_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive caption for media"""
+    if 'broadcast_type' not in context.user_data:
+        return ConversationHandler.END
+    
+    text = update.message.text
+    
+    if text.startswith('/skip'):
+        context.user_data['broadcast_caption'] = ""
+    else:
+        context.user_data['broadcast_caption'] = text
+    
+    await show_broadcast_preview(update, context)
+    return ConversationHandler.END
+
+async def show_broadcast_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show broadcast preview before sending"""
+    broadcast_type = context.user_data['broadcast_type']
+    caption = context.user_data.get('broadcast_caption', "")
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ Send to All Users", callback_data="broadcast_confirm")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="broadcast_cancel")]
+    ]
+    
+    preview_text = f"<b>📢 BROADCAST PREVIEW</b>\n\n"
+    if caption:
+        preview_text += f"<b>Caption:</b> {caption}\n\n"
+    
+    # Send preview based on type
+    if broadcast_type == "photo":
+        await context.bot.send_photo(
+            chat_id=update.effective_chat.id,
+            photo=context.user_data['broadcast_media'],
+            caption=preview_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    elif broadcast_type == "video":
+        await context.bot.send_video(
+            chat_id=update.effective_chat.id,
+            video=context.user_data['broadcast_media'],
+            caption=preview_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    elif broadcast_type == "document":
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=context.user_data['broadcast_media'],
+            caption=preview_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=preview_text + context.user_data['broadcast_text'],
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Confirm and send broadcast to all users"""
+    query = update.callback_query
+    await query.answer()
+    
+    await query.edit_message_text("📤 Broadcasting to all users... This may take a while.")
+    
+    # Get all users
+    async with db_pool.acquire() as conn:
+        users = await conn.fetch("SELECT telegram_id FROM users WHERE is_banned = FALSE")
+    
+    total = len(users)
+    success = 0
+    failed = 0
+    failed_users = []
+    
+    broadcast_type = context.user_data['broadcast_type']
+    media_id = context.user_data.get('broadcast_media')
+    caption = context.user_data.get('broadcast_caption', "")
+    text = context.user_data.get('broadcast_text', "")
+    
+    # Add broadcast header
+    header = "<b>📢 ADMIN ANNOUNCEMENT</b>\n\n"
+    full_caption = header + caption
+    full_text = header + text
+    
+    # Send to each user
+    for i, user in enumerate(users):
+        try:
+            if broadcast_type == "photo":
+                await context.bot.send_photo(
+                    chat_id=user['telegram_id'],
+                    photo=media_id,
+                    caption=full_caption,
+                    parse_mode="HTML"
+                )
+            elif broadcast_type == "video":
+                await context.bot.send_video(
+                    chat_id=user['telegram_id'],
+                    video=media_id,
+                    caption=full_caption,
+                    parse_mode="HTML"
+                )
+            elif broadcast_type == "document":
+                await context.bot.send_document(
+                    chat_id=user['telegram_id'],
+                    document=media_id,
+                    caption=full_caption,
+                    parse_mode="HTML"
+                )
+            else:  # text
+                await context.bot.send_message(
+                    chat_id=user['telegram_id'],
+                    text=full_text,
+                    parse_mode="HTML"
+                )
+            success += 1
+            
+            # Update progress every 10 users
+            if i % 10 == 0 and i > 0:
+                await query.message.edit_text(f"📤 Broadcasting... {i}/{total} sent")
+                
+        except Exception as e:
+            failed += 1
+            failed_users.append(str(user['telegram_id']))
+            print(f"Failed to send to {user['telegram_id']}: {e}")
+        
+        # Small delay to avoid rate limiting
+        await asyncio.sleep(0.1)
+    
+    # Clear broadcast data
+    context.user_data.clear()
+    
+    # Send report
+    report_text = (
+        f"<b>📢 BROADCAST COMPLETE</b>\n\n"
+        f"<b>✅ Successful:</b> {success}\n"
+        f"<b>❌ Failed:</b> {failed}\n"
+    )
+    
+    if failed_users:
+        report_text += f"\n<b>Failed Users:</b> {', '.join(failed_users[:10])}"
+        if len(failed_users) > 10:
+            report_text += f" and {len(failed_users) - 10} more..."
+    
+    keyboard = [[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_back")]]
+    
+    await query.message.edit_text(
+        report_text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def broadcast_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel broadcast"""
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data.clear()
+    
+    await query.edit_message_text(
+        "❌ Broadcast cancelled.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_back")]])
+    )
+
+# ---------------- Updated Admin Panel ----------------
+
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show admin panel"""
     user_id = update.effective_user.id
@@ -1663,15 +2319,57 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     keyboard = [
+        [InlineKeyboardButton("👥 User Management", callback_data="admin_users")],
         [InlineKeyboardButton("📊 Statistics", callback_data="admin_stats")],
         [InlineKeyboardButton("🚨 Reports", callback_data="admin_reports")],
-        [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast_menu")],
+        [InlineKeyboardButton("📝 System Logs", callback_data="admin_logs")],
         [InlineKeyboardButton("🔙 Back to Main", callback_data="admin_back")]
     ]
     
     await update.message.reply_text(
         "<b>🔧 ADMIN PANEL</b>\n\n"
-        "Select an option below:",
+        "Welcome to the enhanced admin panel. Select an option below:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def admin_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show recent system logs"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Get some basic stats for now
+    async with db_pool.acquire() as conn:
+        recent_users = await conn.fetch("""
+            SELECT COUNT(*) FROM users WHERE created_at > NOW() - INTERVAL '24 hours'
+        """)
+        
+        recent_matches = await conn.fetchval("""
+            SELECT COUNT(*) FROM (
+                SELECT s1.liker_id, s1.liked_id 
+                FROM swipes s1
+                INNER JOIN swipes s2 ON s1.liker_id = s2.liked_id AND s1.liked_id = s2.liker_id
+                WHERE s1.created_at > NOW() - INTERVAL '24 hours'
+            ) as matches
+        """)
+        
+        active_chats = await conn.fetchval("SELECT COUNT(*) FROM active_chats")
+    
+    log_text = (
+        f"<b>📝 SYSTEM LOGS (Last 24h)</b>\n\n"
+        f"<b>👥 New Users:</b> {recent_users[0] if recent_users else 0}\n"
+        f"<b>💕 New Matches:</b> {recent_matches or 0}\n"
+        f"<b>💬 Active Chats:</b> {active_chats or 0}\n\n"
+        f"<b>🕒 Server Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"<b>✅ Bot Status:</b> Online\n"
+        f"<b>📦 Database:</b> Connected"
+    )
+    
+    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="admin_back")]]
+    
+    await query.edit_message_text(
+        log_text,
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -2164,7 +2862,7 @@ conv_handler = ConversationHandler(
     per_message=False
 )
 
-# ---------------- MAIN FUNCTION - FIXED FOR RAILWAY ----------------
+# ---------------- MAIN FUNCTION ----------------
 async def main():
     """Main function that will work perfectly on Railway"""
     
@@ -2199,7 +2897,11 @@ async def main():
 
     # Add all handlers
     print("🔧 Adding handlers...")
+    
+    # Conversation handler for registration
     app.add_handler(conv_handler)
+    
+    # Basic commands
     app.add_handler(CommandHandler("find", find_match))
     app.add_handler(CommandHandler("myprofile", show_my_profile))
     app.add_handler(CommandHandler("settings", set_preference))
@@ -2207,7 +2909,6 @@ async def main():
     app.add_handler(CommandHandler("report", report_user))
     app.add_handler(CommandHandler("requests", view_requests))
     app.add_handler(CommandHandler("admin", admin_panel))
-
     app.add_handler(CommandHandler("debug", debug_db))
 
     # Callback query handlers
@@ -2221,12 +2922,33 @@ async def main():
     app.add_handler(CallbackQueryHandler(finish_edit, pattern="^finish_edit$"))
     app.add_handler(CallbackQueryHandler(check_channel_callback, pattern="^check_channel$"))
     
-    # Admin callbacks
+    # Admin callbacks - Basic
     app.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
     app.add_handler(CallbackQueryHandler(admin_reports, pattern="^admin_reports$"))
     app.add_handler(CallbackQueryHandler(admin_broadcast, pattern="^admin_broadcast$"))
     app.add_handler(CallbackQueryHandler(admin_back, pattern="^admin_back$"))
     app.add_handler(CallbackQueryHandler(admin_handle_report, pattern="^(approve_|reject_)"))
+    
+    # Admin callbacks - Enhanced User Management
+    app.add_handler(CallbackQueryHandler(admin_users, pattern="^admin_users$"))
+    app.add_handler(CallbackQueryHandler(admin_list_users, pattern="^admin_list_users$"))
+    app.add_handler(CallbackQueryHandler(admin_users_page, pattern="^admin_users_page_"))
+    app.add_handler(CallbackQueryHandler(admin_view_user, pattern="^admin_view_user_"))
+    app.add_handler(CallbackQueryHandler(admin_ban_user, pattern="^admin_ban_"))
+    app.add_handler(CallbackQueryHandler(admin_unban_user, pattern="^admin_unban_"))
+    app.add_handler(CallbackQueryHandler(admin_banned_users, pattern="^admin_banned_users$"))
+    app.add_handler(CallbackQueryHandler(admin_search_user, pattern="^admin_search_user$"))
+    
+    # Admin callbacks - Enhanced Broadcast
+    app.add_handler(CallbackQueryHandler(admin_broadcast_menu, pattern="^admin_broadcast_menu$"))
+    app.add_handler(CallbackQueryHandler(broadcast_start, pattern="^broadcast_"))
+    app.add_handler(CallbackQueryHandler(broadcast_confirm, pattern="^broadcast_confirm$"))
+    app.add_handler(CallbackQueryHandler(broadcast_cancel, pattern="^broadcast_cancel$"))
+    
+    # Admin callbacks - System Logs
+    app.add_handler(CallbackQueryHandler(admin_logs, pattern="^admin_logs$"))
+    
+    # Chat request handlers
     app.add_handler(CallbackQueryHandler(handle_request_action, pattern="^(accept_|decline_|clear_requests)"))
 
     # Menu button handlers
@@ -2239,8 +2961,26 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_relay))
     app.add_handler(MessageHandler(filters.PHOTO, photo_relay))
     
-    # Admin broadcast handler
-    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.ALL, handle_broadcast_message))
+    # Admin search handler
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_handle_search))
+    
+    # Create broadcast conversation handler
+    broadcast_conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(broadcast_start, pattern="^broadcast_")],
+        states={
+            BROADCAST_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_receive_text)],
+            BROADCAST_MEDIA: [
+                MessageHandler(filters.PHOTO, broadcast_receive_media),
+                MessageHandler(filters.VIDEO, broadcast_receive_media),
+                MessageHandler(filters.Document.ALL, broadcast_receive_media),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_receive_caption)
+            ],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+        per_message=False
+    )
+    
+    app.add_handler(broadcast_conv_handler)
     
     print("✅ All handlers added!")
     print(f"👑 Admin User ID: {ADMIN_USER_ID if ADMIN_USER_ID else 'Not set'}")
@@ -2267,8 +3007,22 @@ async def main():
     print("📱 Send /start to your bot on Telegram")
     print("=" * 50)
     
+    # Self-ping function to keep Render free tier awake
+    async def self_ping():
+        """Ping self to keep Render free tier awake"""
+        while True:
+            await asyncio.sleep(240)  # 4 minutes
+            try:
+                async with aiohttp.ClientSession() as session:
+                    await session.get(f"https://au-university-dating-telegram-bot.onrender.com/health")
+                    print("🔄 Self-ping to keep alive")
+            except:
+                pass
+    
+    # Start self-ping task
+    asyncio.create_task(self_ping())
+    
     # Keep the bot running forever
-    # This is CRITICAL for Railway
     try:
         # Create a permanent event to keep the script alive
         stop_event = asyncio.Event()
@@ -2293,6 +3047,8 @@ if __name__ == "__main__":
         print(f"❌ Fatal error starting bot: {e}")
         import traceback
         traceback.print_exc()
+
+
 
 
 
