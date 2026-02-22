@@ -1,0 +1,25 @@
+# render.yaml
+services:
+  - type: worker
+    name: au-dating-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_USER_ID
+        sync: false
+      - key: CHANNEL_USERNAME
+        value: "@AmboU_confession"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: au-dating-db
+          property: connectionString
+      - key: PORT
+        value: 10000
+
+databases:
+  - name: au-dating-db
+    databaseName: audating
+    user: audating_user
