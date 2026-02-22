@@ -62,7 +62,6 @@ async def init_db():
     print("🔄 Initializing database connection...")
     logger.info("Starting database initialization")
     
-    # Check if DATABASE_URL exists
     if not DATABASE_URL:
         print("❌ ERROR: DATABASE_URL environment variable is missing!")
         logger.error("DATABASE_URL environment variable is missing!")
@@ -71,59 +70,60 @@ async def init_db():
     # Make a copy of the DATABASE_URL to modify
     db_url = DATABASE_URL
     
-    # Ensure Supabase connection uses SSL
-    if "supabase" in db_url and "sslmode" not in db_url:
-        print("🔒 Adding SSL requirement for Supabase connection...")
-        # Add SSL mode for Supabase
+    # For Supabase, we need to handle SSL differently
+    if "supabase" in db_url or "pooler.supabase.com" in db_url:
+        print("🔧 Configuring SSL for Supabase connection...")
+        # Remove any existing sslmode parameters
+        if "?" in db_url:
+            base_url = db_url.split("?")[0]
+            params = db_url.split("?")[1].split("&")
+            params = [p for p in params if not p.startswith("sslmode=")]
+            db_url = base_url + "?" + "&".join(params) if params else base_url
+        else:
+            base_url = db_url
+        
+        # Add the correct SSL parameters
         if "?" in db_url:
             db_url += "&sslmode=require"
         else:
             db_url += "?sslmode=require"
-        print(f"✅ SSL enabled for Supabase")
+        
+        print(f"✅ SSL configured for Supabase")
     
-    # Show partial URL for debugging (don't show full password)
-    if "postgresql://" in db_url:
-        # Mask the password for security
-        parts = db_url.split("@")
-        if len(parts) == 2:
-            safe_url = parts[0].split(":")[0] + ":***@" + parts[1]
-            print(f"📦 Connecting to: {safe_url}")
-            logger.info(f"Connecting to database: {safe_url}")
-        else:
-            print(f"📦 Database URL: {db_url[:50]}...")
+    # Show partial URL for debugging
+    safe_url = mask_database_url(db_url)
+    print(f"📦 Connecting to: {safe_url}")
+    logger.info(f"Connecting to database: {safe_url}")
     
     max_retries = 3
-    retry_delay = 5  # seconds
+    retry_delay = 5
     
     for attempt in range(max_retries):
         try:
             print(f"Attempt {attempt + 1}/{max_retries}...")
             logger.info(f"Database connection attempt {attempt + 1}/{max_retries}")
             
-            # Create connection pool with proper timeouts and SSL
+            # Create connection pool with SSL disabled for certificate verification
             db_pool = await asyncpg.create_pool(
-                dsn=db_url,  # Use the modified URL with SSL
+                dsn=db_url,
                 min_size=1,
                 max_size=10,
-                max_inactive_connection_lifetime=300,  # 5 minutes
+                max_inactive_connection_lifetime=300,
                 command_timeout=60,
-                timeout=30,  # Connection timeout
-                statement_cache_size=0,  # Disable statement cache for now
-                ssl=True  # Explicitly enable SSL
+                timeout=30,
+                statement_cache_size=0,
+                ssl='require'  # Changed from True to 'require' which doesn't verify certs
             )
             
             # Test the connection
             async with db_pool.acquire() as conn:
-                # Simple test query
                 db_version = await conn.fetchval("SELECT version()")
                 print(f"✅ Connected to PostgreSQL: {db_version.split(',')[0]}")
                 logger.info(f"Successfully connected to PostgreSQL")
                 
-                # Test if we can execute queries
                 test_result = await conn.fetchval("SELECT 1 + 1")
                 print(f"✅ Database test query: 1 + 1 = {test_result}")
             
-            # Create tables
             print("📊 Creating/verifying database tables...")
             logger.info("Creating/verifying database tables")
             await create_tables()
@@ -132,22 +132,6 @@ async def init_db():
             logger.info("Database initialized successfully")
             print("=" * 50)
             return
-            
-        except asyncpg.exceptions.ConnectionDoesNotExistError as e:
-            print(f"❌ Connection failed. Database might not be ready: {e}")
-            logger.error(f"Connection failed: {e}")
-            if attempt < max_retries - 1:
-                print(f"⏳ Retrying in {retry_delay} seconds...")
-                await asyncio.sleep(retry_delay)
-            else:
-                print("❌ Max retries reached. Database connection failed.")
-                logger.error("Max retries reached. Database connection failed.")
-                raise
-                
-        except asyncpg.exceptions.InvalidPasswordError as e:
-            print("❌ Invalid database password. Check your DATABASE_URL.")
-            logger.error(f"Invalid password: {e}")
-            raise
             
         except Exception as e:
             print(f"❌ Database error: {type(e).__name__}: {e}")
@@ -159,6 +143,16 @@ async def init_db():
                 print("❌ Max retries reached. Could not initialize database.")
                 logger.error("Max retries reached. Could not initialize database.")
                 raise
+
+def mask_database_url(url):
+    """Mask password in database URL for safe logging"""
+    if "postgresql://" in url:
+        parts = url.split("@")
+        if len(parts) == 2:
+            credentials = parts[0].split(":")
+            if len(credentials) >= 2:
+                return f"{credentials[0]}:***@{parts[1]}"
+    return url[:50] + "..."
 async def create_tables():
     """Create all required tables"""
     async with db_pool.acquire() as conn:
@@ -2299,6 +2293,7 @@ if __name__ == "__main__":
         print(f"❌ Fatal error starting bot: {e}")
         import traceback
         traceback.print_exc()
+
 
 
 
