@@ -1451,64 +1451,8 @@ async def start_edit_profile(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
-# ---------------- Edit Profile System ----------------
-async def start_edit_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start editing profile from existing profile view"""
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = query.from_user.id
-    
-    # Load existing profile data into context.user_data for editing
-    async with db_pool.acquire() as conn:
-        user = await conn.fetchrow(
-            "SELECT name, gender, campus, photo_file_id, bio, hobbies, preference FROM users WHERE telegram_id = $1", 
-            user_id
-        )
-    
-    if user:
-        context.user_data['name'] = user['name']
-        context.user_data['gender'] = user['gender']
-        context.user_data['campus'] = user['campus']
-        context.user_data['photo_file_id'] = user['photo_file_id']
-        context.user_data['bio'] = user['bio']
-        context.user_data['hobbies'] = user['hobbies']
-        context.user_data['preference'] = user['preference']
-        context.user_data['editing_existing'] = True
-    
-    # Show edit menu
-    keyboard = [
-        [InlineKeyboardButton("Name", callback_data="edit_name_existing"),
-         InlineKeyboardButton("Gender", callback_data="edit_gender_existing")],
-        [InlineKeyboardButton("Campus", callback_data="edit_campus_existing"),
-         InlineKeyboardButton("Photo", callback_data="edit_photo_existing")],
-        [InlineKeyboardButton("Bio", callback_data="edit_bio_existing"),
-         InlineKeyboardButton("Hobbies", callback_data="edit_hobbies_existing")],
-        [InlineKeyboardButton("✅ Done Editing", callback_data="finish_edit")]
-    ]
-    
-    try:
-        if query.message.photo:
-            await query.edit_message_caption(
-                caption="<b>🔧 EDIT YOUR PROFILE</b>\n\nWhich part do you want to edit?",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-        else:
-            await query.edit_message_text(
-                "<b>🔧 EDIT YOUR PROFILE</b>\n\nWhich part do you want to edit?",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-    except Exception as e:
-        print(f"Error in start_edit_profile: {e}")
-        await context.bot.send_message(
-            chat_id=user_id,
-            text="<b>🔧 EDIT YOUR PROFILE</b>\n\nWhich part do you want to edit?",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
 
+    
 async def handle_edit_existing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle edit choices for existing profile"""
     query = update.callback_query
@@ -3508,6 +3452,7 @@ if __name__ == "__main__":
         print(f"❌ Fatal error starting bot: {e}")
         import traceback
         traceback.print_exc()
+
 
 
 
