@@ -2031,8 +2031,8 @@ async def admin_handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # ---------------- Enhanced Broadcast System ----------------
 
-# Broadcast states
-BROADCAST_TEXT, BROADCAST_MEDIA = range(2)
+# Broadcast states (make sure these numbers don't conflict with other states)
+BROADCAST_TEXT, BROADCAST_MEDIA = range(16, 18)  # Using 16 and 17 to avoid conflicts
 
 async def admin_broadcast_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show broadcast options"""
@@ -2061,6 +2061,7 @@ async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     broadcast_type = query.data.replace("broadcast_", "")
     context.user_data['broadcast_type'] = broadcast_type
+    context.user_data['broadcasting'] = True
     
     messages = {
         "text": "📝 Send the text message you want to broadcast:",
@@ -2074,14 +2075,21 @@ async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
     
-    return BROADCAST_MEDIA if broadcast_type != "text" else BROADCAST_TEXT
+    # Return the appropriate state
+    if broadcast_type == "text":
+        return BROADCAST_TEXT
+    else:
+        return BROADCAST_MEDIA
 
 async def broadcast_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Receive and process text broadcast"""
+    print("📝 broadcast_receive_text called")
+    
     if 'broadcast_type' not in context.user_data:
+        print("❌ No broadcast_type in user_data")
+        await update.message.reply_text("❌ Broadcast session expired. Please start over.")
         return ConversationHandler.END
     
-    broadcast_type = context.user_data['broadcast_type']
     text = update.message.text
     
     # Cancel if requested
@@ -2090,136 +2098,160 @@ async def broadcast_receive_text(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("Broadcast cancelled.")
         return ConversationHandler.END
     
-    # Get confirmation
+    # Store the text
     context.user_data['broadcast_text'] = text
+    print(f"✅ Stored broadcast text: {text[:50]}...")
     
-    # Show preview
-    preview_text = f"<b>📢 BROADCAST PREVIEW</b>\n\n{text}"
-    
+    # Create keyboard with buttons
     keyboard = [
         [InlineKeyboardButton("✅ Send to All Users", callback_data="broadcast_confirm")],
         [InlineKeyboardButton("❌ Cancel", callback_data="broadcast_cancel")]
     ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Send preview
+    preview_text = f"<b>📢 BROADCAST PREVIEW</b>\n\n{text}"
     
     await update.message.reply_text(
         preview_text,
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=reply_markup
     )
     
+    print("✅ Preview sent with buttons")
     return ConversationHandler.END
 
 async def broadcast_receive_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Receive and process media broadcast"""
+    print("📸 broadcast_receive_media called")
+    
     if 'broadcast_type' not in context.user_data:
+        print("❌ No broadcast_type in user_data")
+        await update.message.reply_text("❌ Broadcast session expired. Please start over.")
         return ConversationHandler.END
     
     broadcast_type = context.user_data['broadcast_type']
+    print(f"Broadcast type: {broadcast_type}")
     
-    # Store media info
+    # Store media info based on type
     if broadcast_type == "photo" and update.message.photo:
         context.user_data['broadcast_media'] = update.message.photo[-1].file_id
         context.user_data['broadcast_caption'] = update.message.caption or ""
+        print(f"✅ Stored photo: {context.user_data['broadcast_media']}")
+        print(f"✅ Stored caption: {context.user_data['broadcast_caption']}")
+        
     elif broadcast_type == "video" and update.message.video:
         context.user_data['broadcast_media'] = update.message.video.file_id
         context.user_data['broadcast_caption'] = update.message.caption or ""
+        print(f"✅ Stored video: {context.user_data['broadcast_media']}")
+        
     elif broadcast_type == "document" and update.message.document:
         context.user_data['broadcast_media'] = update.message.document.file_id
         context.user_data['broadcast_caption'] = update.message.caption or ""
+        print(f"✅ Stored document: {context.user_data['broadcast_media']}")
+        
     else:
         await update.message.reply_text(f"❌ Please send a valid {broadcast_type}.")
         return BROADCAST_MEDIA
     
-    # Ask for caption if not provided
-    if not context.user_data.get('broadcast_caption') and broadcast_type != "text":
-        await update.message.reply_text(
-            "📝 Now send the caption for your media (or send /skip to send without caption):"
-        )
-        return BROADCAST_TEXT
-    
-    # Show preview
-    await show_broadcast_preview(update, context)
-    return ConversationHandler.END
-
-async def broadcast_receive_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive caption for media"""
-    if 'broadcast_type' not in context.user_data:
-        return ConversationHandler.END
-    
-    text = update.message.text
-    
-    if text.startswith('/skip'):
-        context.user_data['broadcast_caption'] = ""
-    else:
-        context.user_data['broadcast_caption'] = text
-    
+    # Show preview immediately
     await show_broadcast_preview(update, context)
     return ConversationHandler.END
 
 async def show_broadcast_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show broadcast preview before sending"""
-    broadcast_type = context.user_data['broadcast_type']
+    print("🖼️ show_broadcast_preview called")
+    
+    broadcast_type = context.user_data.get('broadcast_type')
     caption = context.user_data.get('broadcast_caption', "")
     
+    if not broadcast_type:
+        print("❌ No broadcast_type found")
+        await update.message.reply_text("❌ Error: Broadcast type not found. Please start over.")
+        return
+    
+    # Create keyboard with buttons
     keyboard = [
         [InlineKeyboardButton("✅ Send to All Users", callback_data="broadcast_confirm")],
         [InlineKeyboardButton("❌ Cancel", callback_data="broadcast_cancel")]
     ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     
     preview_text = f"<b>📢 BROADCAST PREVIEW</b>\n\n"
     if caption:
         preview_text += f"<b>Caption:</b> {caption}\n\n"
     
     # Send preview based on type
-    if broadcast_type == "photo":
-        await context.bot.send_photo(
-            chat_id=update.effective_chat.id,
-            photo=context.user_data['broadcast_media'],
-            caption=preview_text,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    elif broadcast_type == "video":
-        await context.bot.send_video(
-            chat_id=update.effective_chat.id,
-            video=context.user_data['broadcast_media'],
-            caption=preview_text,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    elif broadcast_type == "document":
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=context.user_data['broadcast_media'],
-            caption=preview_text,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    else:
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=preview_text + context.user_data['broadcast_text'],
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+    try:
+        if broadcast_type == "photo":
+            await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=context.user_data['broadcast_media'],
+                caption=preview_text,
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+        elif broadcast_type == "video":
+            await context.bot.send_video(
+                chat_id=update.effective_chat.id,
+                video=context.user_data['broadcast_media'],
+                caption=preview_text,
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+        elif broadcast_type == "document":
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=context.user_data['broadcast_media'],
+                caption=preview_text,
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+        else:  # text
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=preview_text + context.user_data.get('broadcast_text', ''),
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+        print("✅ Preview sent successfully with buttons")
+    except Exception as e:
+        print(f"❌ Error sending preview: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
 
 async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Confirm and send broadcast to all users"""
+    print("✅ broadcast_confirm called!")
     query = update.callback_query
     await query.answer()
+    
+    print(f"User data: {context.user_data}")
     
     await query.edit_message_text("📤 Broadcasting to all users... This may take a while.")
     
     # Get all users
-    async with db_pool.acquire() as conn:
-        users = await conn.fetch("SELECT telegram_id FROM users WHERE is_banned = FALSE")
+    try:
+        async with db_pool.acquire() as conn:
+            users = await conn.fetch("SELECT telegram_id FROM users WHERE is_banned = FALSE")
+    except Exception as e:
+        print(f"❌ Database error: {e}")
+        await query.edit_message_text("❌ Error accessing database.")
+        return
+    
+    if not users:
+        await query.edit_message_text(
+            "❌ No users found in database.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_back")]])
+        )
+        context.user_data.clear()
+        return
     
     total = len(users)
     success = 0
     failed = 0
     failed_users = []
     
-    broadcast_type = context.user_data['broadcast_type']
+    broadcast_type = context.user_data.get('broadcast_type', 'text')
     media_id = context.user_data.get('broadcast_media')
     caption = context.user_data.get('broadcast_caption', "")
     text = context.user_data.get('broadcast_text', "")
@@ -2263,7 +2295,10 @@ async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             # Update progress every 10 users
             if i % 10 == 0 and i > 0:
-                await query.message.edit_text(f"📤 Broadcasting... {i}/{total} sent")
+                try:
+                    await query.message.edit_text(f"📤 Broadcasting... {i}/{total} sent")
+                except:
+                    pass  # Message might be too old to edit
                 
         except Exception as e:
             failed += 1
@@ -2281,6 +2316,7 @@ async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>📢 BROADCAST COMPLETE</b>\n\n"
         f"<b>✅ Successful:</b> {success}\n"
         f"<b>❌ Failed:</b> {failed}\n"
+        f"<b>👥 Total Users:</b> {total}\n"
     )
     
     if failed_users:
@@ -2290,14 +2326,24 @@ async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_back")]]
     
-    await query.message.edit_text(
-        report_text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    try:
+        await query.message.edit_text(
+            report_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except:
+        # If message can't be edited, send new message
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text=report_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
 async def broadcast_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel broadcast"""
+    print("❌ broadcast_cancel called")
     query = update.callback_query
     await query.answer()
     
@@ -2307,7 +2353,6 @@ async def broadcast_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "❌ Broadcast cancelled.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_back")]])
     )
-
 # ---------------- Updated Admin Panel ----------------
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2966,6 +3011,7 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_handle_search))
     
     # Create broadcast conversation handler
+        # Create broadcast conversation handler
     broadcast_conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(broadcast_start, pattern="^broadcast_")],
         states={
@@ -2974,11 +3020,11 @@ async def main():
                 MessageHandler(filters.PHOTO, broadcast_receive_media),
                 MessageHandler(filters.VIDEO, broadcast_receive_media),
                 MessageHandler(filters.Document.ALL, broadcast_receive_media),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_receive_caption)
             ],
         },
         fallbacks=[CommandHandler('cancel', cancel)],
-        per_message=False
+        per_message=False,
+        name="broadcast_conversation"
     )
     
     app.add_handler(broadcast_conv_handler)
@@ -3186,6 +3232,7 @@ if __name__ == "__main__":
         print(f"❌ Fatal error starting bot: {e}")
         import traceback
         traceback.print_exc()
+
 
 
 
