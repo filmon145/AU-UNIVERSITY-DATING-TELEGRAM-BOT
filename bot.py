@@ -1237,6 +1237,53 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML"
             )
 
+async def show_my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show user's own profile"""
+    user_id = update.effective_user.id
+    
+    async with db_pool.acquire() as conn:
+        user = await conn.fetchrow(
+            "SELECT name, gender, campus, bio, hobbies, photo_file_id FROM users WHERE telegram_id = $1", 
+            user_id
+        )
+
+    if not user:
+        await update.message.reply_text("❌ You don't have a profile yet! Type /start.")
+        return
+
+    name = user['name']
+    gender = user['gender']
+    campus = user['campus']
+    bio = user['bio']
+    hobbies = user['hobbies']
+    photo_id = user['photo_file_id']
+    
+    profile_text = (
+        "<b>👤 YOUR PROFILE</b>\n\n"
+        f"<b>✨ Name:</b> {name}\n"
+        f"<b>⚧ Gender:</b> {gender}\n"
+        f"<b>📍 Campus:</b> {campus}\n"
+        f"<b>📝 Bio:</b> {bio or 'Not set'}\n"
+        f"<b>🎯 Hobbies:</b> {hobbies or 'Not set'}"
+    )
+
+    keyboard = [[InlineKeyboardButton("Edit Profile ✏️", callback_data="start_edit_profile")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if photo_id:
+        await update.message.reply_photo(
+            photo=photo_id, 
+            caption=profile_text,
+            parse_mode="HTML",
+            reply_markup=reply_markup
+        )
+    else:
+        await update.message.reply_text(
+            profile_text,
+            parse_mode="HTML",
+            reply_markup=reply_markup
+        )
+
 async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check if user is banned
     user_id = update.effective_user.id
@@ -1346,6 +1393,64 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Continue showing more profiles
     return await find_match(update, context)
+
+# ---------------- Edit Profile System ----------------
+async def start_edit_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start editing profile from existing profile view"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    
+    # Load existing profile data into context.user_data for editing
+    async with db_pool.acquire() as conn:
+        user = await conn.fetchrow(
+            "SELECT name, gender, campus, photo_file_id, bio, hobbies, preference FROM users WHERE telegram_id = $1", 
+            user_id
+        )
+    
+    if user:
+        context.user_data['name'] = user['name']
+        context.user_data['gender'] = user['gender']
+        context.user_data['campus'] = user['campus']
+        context.user_data['photo_file_id'] = user['photo_file_id']
+        context.user_data['bio'] = user['bio']
+        context.user_data['hobbies'] = user['hobbies']
+        context.user_data['preference'] = user['preference']
+        context.user_data['editing_existing'] = True
+    
+    # Show edit menu
+    keyboard = [
+        [InlineKeyboardButton("Name", callback_data="edit_name_existing"),
+         InlineKeyboardButton("Gender", callback_data="edit_gender_existing")],
+        [InlineKeyboardButton("Campus", callback_data="edit_campus_existing"),
+         InlineKeyboardButton("Photo", callback_data="edit_photo_existing")],
+        [InlineKeyboardButton("Bio", callback_data="edit_bio_existing"),
+         InlineKeyboardButton("Hobbies", callback_data="edit_hobbies_existing")],
+        [InlineKeyboardButton("✅ Done Editing", callback_data="finish_edit")]
+    ]
+    
+    try:
+        if query.message.photo:
+            await query.edit_message_caption(
+                caption="<b>🔧 EDIT YOUR PROFILE</b>\n\nWhich part do you want to edit?",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            await query.edit_message_text(
+                "<b>🔧 EDIT YOUR PROFILE</b>\n\nWhich part do you want to edit?",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+    except Exception as e:
+        print(f"Error in start_edit_profile: {e}")
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="<b>🔧 EDIT YOUR PROFILE</b>\n\nWhich part do you want to edit?",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 # ---------------- Edit Profile System ----------------
 async def start_edit_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start editing profile from existing profile view"""
@@ -3403,6 +3508,7 @@ if __name__ == "__main__":
         print(f"❌ Fatal error starting bot: {e}")
         import traceback
         traceback.print_exc()
+
 
 
 
