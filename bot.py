@@ -2655,7 +2655,146 @@ async def admin_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
+# ---------------- Simplified Broadcast System ----------------
 
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Broadcast any message by replying to it - ADMIN ONLY"""
+    user_id = update.effective_user.id
+    
+    # Check if user is admin
+    if user_id != ADMIN_USER_ID:
+        await update.message.reply_text("❌ This command is for admins only.")
+        return
+    
+    # Check if replying to a message
+    if not update.message.reply_to_message:
+        await update.message.reply_text(
+            "📢 <b>Broadcast Command</b>\n\n"
+            "To broadcast a message:\n"
+            "1. Find any message (text, photo, video, etc.)\n"
+            "2. Reply to it with /broadcast\n"
+            "3. Confirm the broadcast",
+            parse_mode="HTML"
+        )
+        return
+    
+    # Store the message to broadcast
+    context.user_data['broadcast_from_chat_id'] = update.message.reply_to_message.chat_id
+    context.user_data['broadcast_message_id'] = update.message.reply_to_message.message_id
+    
+    # Create preview
+    preview_text = "📢 <b>Broadcast Preview</b>\n\n"
+    preview_text += "The following message will be sent to all users:\n\n"
+    
+    msg = update.message.reply_to_message
+    if msg.photo:
+        preview_text += "📷 <i>[Photo" + (" with caption" if msg.caption else "") + "]</i>"
+    elif msg.video:
+        preview_text += "🎥 <i>[Video" + (" with caption" if msg.caption else "") + "]</i>"
+    elif msg.document:
+        preview_text += "📄 <i>[Document" + (" with caption" if msg.caption else "") + "]</i>"
+    elif msg.sticker:
+        preview_text += "🎭 <i>[Sticker]</i>"
+    elif msg.animation:
+        preview_text += "🎬 <i>[GIF/Animation" + (" with caption" if msg.caption else "") + "]</i>"
+    elif msg.text:
+        preview_text += f"💬 <i>\"{msg.text[:100]}\"</i>"
+        if len(msg.text) > 100:
+            preview_text += "..."
+    else:
+        preview_text += "❓ <i>[Unsupported message type]</i>"
+    
+    # Confirmation buttons
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Yes, Broadcast", callback_data="confirm_broadcast"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel_broadcast")
+        ]
+    ]
+    
+    await update.message.reply_text(
+        preview_text + "\n\n⚠️ <b>Confirm Broadcast</b>\n\nAre you sure you want to broadcast this message to all users?",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Confirm and send broadcast"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    if user_id != ADMIN_USER_ID:
+        await query.answer("Unauthorized.", show_alert=True)
+        return
+    
+    # Get stored message info
+    from_chat_id = context.user_data.get('broadcast_from_chat_id')
+    msg_id = context.user_data.get('broadcast_message_id')
+    
+    if not from_chat_id or not msg_id:
+        await query.edit_message_text("❌ Error: Message data not found.")
+        context.user_data.clear()
+        return
+    
+    # Get all active users (non-banned)
+    async with db_pool.acquire() as conn:
+        users = await conn.fetch("SELECT telegram_id FROM users WHERE is_banned = FALSE")
+    
+    if not users:
+        await query.edit_message_text("❌ No users found in database.")
+        context.user_data.clear()
+        return
+    
+    total = len(users)
+    successful = 0
+    failed = 0
+    
+    # Send progress message
+    progress_msg = await query.message.reply_text(f"📤 Broadcasting... 0/{total}")
+    
+    for i, user in enumerate(users):
+        try:
+            # copy_message works for ALL message types!
+            await context.bot.copy_message(
+                chat_id=user['telegram_id'],
+                from_chat_id=from_chat_id,
+                message_id=msg_id
+            )
+            successful += 1
+        except Exception as e:
+            failed += 1
+            print(f"Failed to send to {user['telegram_id']}: {e}")
+        
+        # Update progress every 10 users
+        if i % 10 == 0 and i > 0:
+            try:
+                await progress_msg.edit_text(f"📤 Broadcasting... {successful + failed}/{total}")
+            except:
+                pass
+        
+        # Small delay to avoid rate limiting
+        await asyncio.sleep(0.05)
+    
+    # Final report
+    await progress_msg.edit_text(
+        f"✅ <b>Broadcast Complete!</b>\n\n"
+        f"✅ Successful: {successful}\n"
+        f"❌ Failed: {failed}\n"
+        f"👥 Total: {total}",
+        parse_mode="HTML"
+    )
+    
+    await query.edit_message_text("✅ Broadcast completed.")
+    context.user_data.clear()
+
+async def broadcast_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel broadcast"""
+    query = update.callback_query
+    await query.answer()
+    
+    await query.edit_message_text("❌ Broadcast cancelled.")
+    context.user_data.clear()
 # ---------------- Chat System ----------------
 async def start_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2956,6 +3095,10 @@ async def main():
     app.add_handler(CommandHandler("requests", view_requests))
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CommandHandler("debug", debug_db))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
+
+# Add these with your other callback query handlers
+
 
     # Callback query handlers
     app.add_handler(CallbackQueryHandler(handle_like, pattern="^(like_|report_)"))
@@ -2967,6 +3110,8 @@ async def main():
     app.add_handler(CallbackQueryHandler(handle_save_edit, pattern="^(save_gender_|save_campus_|skip_)"))
     app.add_handler(CallbackQueryHandler(finish_edit, pattern="^finish_edit$"))
     app.add_handler(CallbackQueryHandler(check_channel_callback, pattern="^check_channel$"))
+    app.add_handler(CallbackQueryHandler(broadcast_confirm, pattern="^confirm_broadcast$"))
+    app.add_handler(CallbackQueryHandler(broadcast_cancel, pattern="^cancel_broadcast$"))
     
     # Admin callbacks - Basic
     app.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
@@ -3230,6 +3375,7 @@ if __name__ == "__main__":
         print(f"❌ Fatal error starting bot: {e}")
         import traceback
         traceback.print_exc()
+
 
 
 
