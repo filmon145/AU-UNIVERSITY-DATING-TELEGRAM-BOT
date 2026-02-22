@@ -2863,6 +2863,7 @@ conv_handler = ConversationHandler(
 )
 
 # ---------------- MAIN FUNCTION - WEBHOOK VERSION ----------------
+# ---------------- MAIN FUNCTION - WEBHOOK VERSION ----------------
 async def main():
     """Main function using webhook (recommended for Render)"""
     
@@ -2882,10 +2883,15 @@ async def main():
         print("Please add it in Render dashboard: https://au-university-dating-telegram-bot.onrender.com")
         return
     
+    # Remove any trailing slash
+    RENDER_URL = RENDER_URL.rstrip('/')
+    
     WEBHOOK_PATH = "/webhook"
     WEBHOOK_URL = f"{RENDER_URL}{WEBHOOK_PATH}"
     
-    print(f"🌐 Setting up webhook on {WEBHOOK_URL}")
+    print(f"🌐 Configured webhook URL: {WEBHOOK_URL}")
+    print(f"🔍 To test manually, visit: {RENDER_URL}/health")
+    print(f"🔍 For debug info, visit: {RENDER_URL}/test")
     
     # Create Telegram application
     print("🤖 Creating Telegram bot application...")
@@ -2982,21 +2988,33 @@ async def main():
     print(f"👑 Admin User ID: {ADMIN_USER_ID if ADMIN_USER_ID else 'Not set'}")
     print(f"📢 Channel: {CHANNEL_USERNAME}")
     
-    # Set up webhook
+    # Set up webhook with verification
     print("🔧 Setting webhook...")
     
     # Delete any existing webhook first
-    await app.bot.delete_webhook(drop_pending_updates=True)
+    delete_result = await app.bot.delete_webhook(drop_pending_updates=True)
+    print(f"✅ Delete webhook result: {delete_result}")
     
     # Set the new webhook
-    await app.bot.set_webhook(
+    set_result = await app.bot.set_webhook(
         url=WEBHOOK_URL,
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
-        max_connections=40  # Optimal for performance
+        max_connections=40
     )
+    print(f"✅ Set webhook result: {set_result}")
     
-    print(f"✅ Webhook set to: {WEBHOOK_URL}")
+    # Verify webhook was set correctly
+    webhook_info = await app.bot.get_webhook_info()
+    print(f"📊 Webhook info:")
+    print(f"   URL: {webhook_info.url}")
+    print(f"   Pending updates: {webhook_info.pending_update_count}")
+    print(f"   Max connections: {webhook_info.max_connections}")
+    
+    if webhook_info.url != WEBHOOK_URL:
+        print(f"⚠️ Warning: Webhook URL mismatch!")
+        print(f"   Expected: {WEBHOOK_URL}")
+        print(f"   Actual: {webhook_info.url}")
     
     # Start webhook server
     print(f"🌐 Starting webhook server on port {PORT}...")
@@ -3008,26 +3026,75 @@ async def main():
     async def handle_health(request):
         return web.Response(text="Bot is healthy")
     
-    # Webhook endpoint
+    # Webhook endpoint with debugging
     async def handle_webhook(request):
-        """Handle incoming updates from Telegram"""
+        """Handle incoming updates from Telegram with debug logging"""
+        print("=" * 50)
+        print(f"📨 Webhook received at {datetime.now()}")
+        print(f"Request path: {request.path}")
+        
         try:
-            # Parse the incoming update
-            update_data = await request.json()
-            update = Update.de_json(update_data, app.bot)
+            # Read and log raw data
+            text = await request.text()
+            print(f"Raw data received (first 200 chars): {text[:200]}")
             
-            # Process the update
-            await app.process_update(update)
+            # Parse JSON
+            data = await request.json()
+            print(f"✅ Successfully parsed JSON")
             
+            if 'update_id' in data:
+                print(f"📱 Update ID: {data['update_id']}")
+                if 'message' in data:
+                    print(f"💬 Message from user {data['message']['from']['id']}: {data['message'].get('text', '[no text]')}")
+                
+                # Process the update
+                update = Update.de_json(data, app.bot)
+                await app.process_update(update)
+                print(f"✅ Update processed successfully")
+            else:
+                print(f"⚠️ Not a Telegram update")
+            
+            print("=" * 50)
             return web.Response(status=200, text="OK")
+            
         except Exception as e:
             print(f"❌ Error processing webhook: {e}")
+            import traceback
+            traceback.print_exc()
+            print("=" * 50)
             return web.Response(status=500, text="Error")
     
-    # Add routes
+    # Test endpoint to verify server is working
+    async def handle_test(request):
+        """Test endpoint to verify server is accessible"""
+        bot_info = await app.bot.get_me()
+        return web.json_response({
+            "status": "running",
+            "time": str(datetime.now()),
+            "bot_name": bot_info.first_name,
+            "bot_username": bot_info.username,
+            "endpoints": {
+                "webhook": WEBHOOK_PATH,
+                "health": "/health",
+                "test": "/test",
+                "root": "/"
+            }
+        })
+    
+    # Root endpoint
+    async def handle_root(request):
+        return web.Response(text="🤖 AU Dating Bot is running. Use /health for status, /test for debug info.")
+    
+    # Add all routes
     web_app.router.add_post(WEBHOOK_PATH, handle_webhook)
-    web_app.router.add_get('/', handle_health)
+    web_app.router.add_get('/', handle_root)
     web_app.router.add_get('/health', handle_health)
+    web_app.router.add_get('/test', handle_test)
+    
+    # Verify all endpoints are registered
+    print("📋 Registered routes:")
+    for route in web_app.router.routes():
+        print(f"   {route.method} {route.path}")
     
     # Start the web server
     runner = web.AppRunner(web_app)
@@ -3048,6 +3115,8 @@ async def main():
     print("🎉 AU DATING BOT IS RUNNING WITH WEBHOOK!")
     print(f"📱 Webhook URL: {WEBHOOK_URL}")
     print(f"💡 Health check: {RENDER_URL}/health")
+    print(f"🔧 Test endpoint: {RENDER_URL}/test")
+    print(f"📝 To test manually, send a POST request to {WEBHOOK_URL}")
     print("=" * 50)
     
     # Keep the bot running
@@ -3075,6 +3144,7 @@ if __name__ == "__main__":
         print(f"❌ Fatal error starting bot: {e}")
         import traceback
         traceback.print_exc()
+
 
 
 
