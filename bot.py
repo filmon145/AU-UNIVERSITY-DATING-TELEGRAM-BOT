@@ -1120,7 +1120,7 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Don't show banned users
         if pref == "Both":
             query = """
-            SELECT telegram_id, name, campus, bio, photo_file_id
+            SELECT telegram_id, name, gender, campus, bio, photo_file_id
             FROM users
             WHERE gender IN ('Male', 'Female') AND is_banned = FALSE
             AND telegram_id != $1
@@ -1133,7 +1133,7 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
             params = (user_id,)
         else:
             query = """
-            SELECT telegram_id, name, campus, bio, photo_file_id
+            SELECT telegram_id, name, gender, campus, bio, photo_file_id
             FROM users
             WHERE gender = $1 AND is_banned = FALSE
             AND telegram_id != $2
@@ -1160,11 +1160,21 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     match_id = match['telegram_id']
     name = match['name']
+    gender = match['gender']  # Get gender from database
     campus = match['campus']
     bio = match['bio']
     photo = match['photo_file_id']
     
-    text = f"🔥 New Profile\n👤 {name}\n📍 {campus}\n📝 {bio or 'No bio'}"
+    # Add gender to the display with appropriate emoji
+    gender_emoji = "👨" if gender == "Male" else "👩" if gender == "Female" else "⚧"
+    
+    text = (
+        f"🔥 <b>New Profile</b>\n\n"
+        f"<b>👤 Name:</b> {name}\n"
+        f"<b>{gender_emoji} Gender:</b> {gender}\n"
+        f"<b>📍 Campus:</b> {campus}\n"
+        f"<b>📝 Bio:</b> {bio or 'Not set'}"
+    )
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("❤️ Like", callback_data=f"like_{match_id}"),
@@ -1176,16 +1186,41 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await update.callback_query.message.delete()
             if photo:
-                await context.bot.send_photo(chat_id=user_id, photo=photo, caption=text, reply_markup=keyboard)
+                await context.bot.send_photo(
+                    chat_id=user_id, 
+                    photo=photo, 
+                    caption=text, 
+                    reply_markup=keyboard,
+                    parse_mode="HTML"
+                )
             else:
-                await context.bot.send_message(chat_id=user_id, text=text, reply_markup=keyboard)
+                await context.bot.send_message(
+                    chat_id=user_id, 
+                    text=text, 
+                    reply_markup=keyboard,
+                    parse_mode="HTML"
+                )
         except:
-            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=keyboard)
+            await context.bot.send_message(
+                chat_id=user_id, 
+                text=text, 
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
     else:
         if photo:
-            await update.message.reply_photo(photo=photo, caption=text, reply_markup=keyboard)
+            await update.message.reply_photo(
+                photo=photo, 
+                caption=text, 
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
         else:
-            await update.message.reply_text(text, reply_markup=keyboard)
+            await update.message.reply_text(
+                text, 
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
 
 async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check if user is banned
@@ -1221,9 +1256,7 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await conn.execute("INSERT INTO swipes (liker_id, liked_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", user_id, liked_id)
 
         is_match = await conn.fetchrow("SELECT 1 FROM swipes WHERE liker_id = $1 AND liked_id = $2", liked_id, user_id)
-
-        me = await conn.fetchrow("SELECT name, photo_file_id FROM users WHERE telegram_id = $1", user_id)
-
+        me = await conn.fetchrow("SELECT name, gender, photo_file_id FROM users WHERE telegram_id = $1", user_id)
     if is_match:
         match_alert = "<b>🎆 BOOM! IT'S A MATCH! 🎆</b>\n\nYou both liked each other! Don't wait, say hi! 👋"
         
@@ -1251,7 +1284,11 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_caption(caption="⚡ Like sent! Looking for more...")
         
         try:
-            caption = f"<b>🔥 SOMEONE LIKED YOU!</b>\n\n👤 {me['name']} just swiped right. Swipe /find to see who it is!"
+            # Inside handle_like function, find this section:
+try:
+
+    gender_emoji = "👨" if me['gender'] == "Male" else "👩" if me['gender'] == "Female" else "⚧"
+    caption = f"<b>🔥 SOMEONE LIKED YOU!</b>\n\n{gender_emoji} <b>{me['name']}</b> just swiped right. Swipe /find to see who it is!"
             if me['photo_file_id']:
                 await context.bot.send_photo(
                     chat_id=liked_id, 
@@ -3375,6 +3412,7 @@ if __name__ == "__main__":
         print(f"❌ Fatal error starting bot: {e}")
         import traceback
         traceback.print_exc()
+
 
 
 
