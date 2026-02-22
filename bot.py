@@ -2987,9 +2987,7 @@ async def main():
     
     # Admin callbacks - Enhanced Broadcast
     app.add_handler(CallbackQueryHandler(admin_broadcast_menu, pattern="^admin_broadcast_menu$"))
-    app.add_handler(CallbackQueryHandler(broadcast_start, pattern="^broadcast_"))
-    app.add_handler(CallbackQueryHandler(broadcast_confirm, pattern="^broadcast_confirm$"))
-    app.add_handler(CallbackQueryHandler(broadcast_cancel, pattern="^broadcast_cancel$"))
+
     
     # Admin callbacks - System Logs
     app.add_handler(CallbackQueryHandler(admin_logs, pattern="^admin_logs$"))
@@ -3232,6 +3230,7 @@ if __name__ == "__main__":
         print(f"❌ Fatal error starting bot: {e}")
         import traceback
         traceback.print_exc()
+
 
 
 
