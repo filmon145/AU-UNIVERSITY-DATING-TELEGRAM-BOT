@@ -2,6 +2,7 @@ import sys
 import os
 import asyncio
 import asyncpg
+import logging
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import (
@@ -43,33 +44,53 @@ print(f"✅ Port: {PORT}")
 print("=" * 50)
 
 # Database connection pool
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Database connection pool
 db_pool = None
 
 # ---------------- Database Functions ----------------
-# ---------------- Database Functions ----------------
 async def init_db():
-    """Initialize PostgreSQL database tables with better error handling"""
+    """Initialize PostgreSQL database tables with Supabase SSL support"""
     global db_pool
     
     print("=" * 50)
     print("🔄 Initializing database connection...")
+    logger.info("Starting database initialization")
     
     # Check if DATABASE_URL exists
     if not DATABASE_URL:
         print("❌ ERROR: DATABASE_URL environment variable is missing!")
-        print("Railway should provide this automatically.")
-        print("Check your Railway project -> Variables tab")
+        logger.error("DATABASE_URL environment variable is missing!")
         raise ValueError("DATABASE_URL is required")
     
+    # Make a copy of the DATABASE_URL to modify
+    db_url = DATABASE_URL
+    
+    # Ensure Supabase connection uses SSL
+    if "supabase" in db_url and "sslmode" not in db_url:
+        print("🔒 Adding SSL requirement for Supabase connection...")
+        # Add SSL mode for Supabase
+        if "?" in db_url:
+            db_url += "&sslmode=require"
+        else:
+            db_url += "?sslmode=require"
+        print(f"✅ SSL enabled for Supabase")
+    
     # Show partial URL for debugging (don't show full password)
-    if "postgresql://" in DATABASE_URL:
+    if "postgresql://" in db_url:
         # Mask the password for security
-        parts = DATABASE_URL.split("@")
+        parts = db_url.split("@")
         if len(parts) == 2:
             safe_url = parts[0].split(":")[0] + ":***@" + parts[1]
             print(f"📦 Connecting to: {safe_url}")
+            logger.info(f"Connecting to database: {safe_url}")
         else:
-            print(f"📦 Database URL: {DATABASE_URL[:50]}...")
+            print(f"📦 Database URL: {db_url[:50]}...")
     
     max_retries = 3
     retry_delay = 5  # seconds
@@ -77,16 +98,18 @@ async def init_db():
     for attempt in range(max_retries):
         try:
             print(f"Attempt {attempt + 1}/{max_retries}...")
+            logger.info(f"Database connection attempt {attempt + 1}/{max_retries}")
             
-            # Create connection pool with proper timeouts
+            # Create connection pool with proper timeouts and SSL
             db_pool = await asyncpg.create_pool(
-                dsn=DATABASE_URL,  # Use the full URL directly
+                dsn=db_url,  # Use the modified URL with SSL
                 min_size=1,
                 max_size=10,
                 max_inactive_connection_lifetime=300,  # 5 minutes
                 command_timeout=60,
                 timeout=30,  # Connection timeout
-                statement_cache_size=0  # Disable statement cache for now
+                statement_cache_size=0,  # Disable statement cache for now
+                ssl=True  # Explicitly enable SSL
             )
             
             # Test the connection
@@ -94,6 +117,7 @@ async def init_db():
                 # Simple test query
                 db_version = await conn.fetchval("SELECT version()")
                 print(f"✅ Connected to PostgreSQL: {db_version.split(',')[0]}")
+                logger.info(f"Successfully connected to PostgreSQL")
                 
                 # Test if we can execute queries
                 test_result = await conn.fetchval("SELECT 1 + 1")
@@ -101,34 +125,40 @@ async def init_db():
             
             # Create tables
             print("📊 Creating/verifying database tables...")
+            logger.info("Creating/verifying database tables")
             await create_tables()
             
             print("✅ Database initialized successfully!")
+            logger.info("Database initialized successfully")
             print("=" * 50)
             return
             
-        except asyncpg.exceptions.ConnectionDoesNotExistError:
-            print(f"❌ Connection failed. Database might not be ready.")
+        except asyncpg.exceptions.ConnectionDoesNotExistError as e:
+            print(f"❌ Connection failed. Database might not be ready: {e}")
+            logger.error(f"Connection failed: {e}")
             if attempt < max_retries - 1:
                 print(f"⏳ Retrying in {retry_delay} seconds...")
                 await asyncio.sleep(retry_delay)
             else:
                 print("❌ Max retries reached. Database connection failed.")
+                logger.error("Max retries reached. Database connection failed.")
                 raise
                 
-        except asyncpg.exceptions.InvalidPasswordError:
+        except asyncpg.exceptions.InvalidPasswordError as e:
             print("❌ Invalid database password. Check your DATABASE_URL.")
+            logger.error(f"Invalid password: {e}")
             raise
             
         except Exception as e:
             print(f"❌ Database error: {type(e).__name__}: {e}")
+            logger.error(f"Database error: {type(e).__name__}: {e}")
             if attempt < max_retries - 1:
                 print(f"⏳ Retrying in {retry_delay} seconds...")
                 await asyncio.sleep(retry_delay)
             else:
                 print("❌ Max retries reached. Could not initialize database.")
+                logger.error("Max retries reached. Could not initialize database.")
                 raise
-
 async def create_tables():
     """Create all required tables"""
     async with db_pool.acquire() as conn:
@@ -2269,6 +2299,7 @@ if __name__ == "__main__":
         print(f"❌ Fatal error starting bot: {e}")
         import traceback
         traceback.print_exc()
+
 
 
 
