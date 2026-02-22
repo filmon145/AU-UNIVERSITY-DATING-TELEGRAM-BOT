@@ -2863,7 +2863,6 @@ conv_handler = ConversationHandler(
 )
 
 # ---------------- MAIN FUNCTION - WEBHOOK VERSION ----------------
-# ---------------- MAIN FUNCTION - WEBHOOK VERSION ----------------
 async def main():
     """Main function using webhook (recommended for Render)"""
     
@@ -2987,6 +2986,11 @@ async def main():
     print("✅ All handlers added!")
     print(f"👑 Admin User ID: {ADMIN_USER_ID if ADMIN_USER_ID else 'Not set'}")
     print(f"📢 Channel: {CHANNEL_USERNAME}")
+    
+    # CRITICAL FIX: Initialize the application BEFORE setting webhook
+    print("🔧 Initializing application...")
+    await app.initialize()
+    print("✅ Application initialized!")
     
     # Set up webhook with verification
     print("🔧 Setting webhook...")
@@ -3174,7 +3178,6 @@ async def main():
         await app.shutdown()
         await runner.cleanup()
         print("✅ Shutdown complete!")
-
 # Start the bot
 if __name__ == "__main__":
     try:
@@ -3183,9 +3186,6 @@ if __name__ == "__main__":
         print(f"❌ Fatal error starting bot: {e}")
         import traceback
         traceback.print_exc()
-
-
-
 
 
 
