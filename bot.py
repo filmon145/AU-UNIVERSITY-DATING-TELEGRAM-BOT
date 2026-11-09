@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 import asyncio
 import asyncpg
 import aiohttp  
@@ -13,6 +14,14 @@ from telegram.ext import (
 from dotenv import load_dotenv
 from aiohttp import web
 
+# Configure UTF-8 encoding for Windows consoles
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 # Load environment variables
 load_dotenv()
 
@@ -22,27 +31,31 @@ load_dotenv()
  EDIT_PHOTO, EDIT_BIO, EDIT_HOBBIES, REPORT_REASON) = range(16)
 
 # Environment variables
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@AmboU_confession")
-DATABASE_URL = os.getenv("DATABASE_URL")
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@AmboU_confession").strip()
+CHECK_CHANNEL = os.getenv("CHECK_CHANNEL", "false").lower() in ("true", "1", "yes")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DATABASE_SSL = os.getenv("DATABASE_SSL", "auto").strip().lower()
 PORT = int(os.getenv("PORT", "8080"))
+RENDER_URL = os.getenv("RENDER_URL", "").strip()
+USE_WEBHOOK = os.getenv("USE_WEBHOOK", "auto").strip().lower()
 
-# Validate required environment variables
-if not BOT_TOKEN:
-    print("❌ ERROR: BOT_TOKEN environment variable is required!")
-    sys.exit(1)
-
-if not DATABASE_URL:
-    print("❌ ERROR: DATABASE_URL environment variable is required!")
-    sys.exit(1)
-
-print("=" * 50)
-print("🚀 Starting AU Dating Bot...")
-print(f"✅ Bot token: {BOT_TOKEN[:10]}...")
-print(f"✅ Database: {DATABASE_URL[:30]}...")
-print(f"✅ Port: {PORT}")
-print("=" * 50)
+def validate_config():
+    """Validate required environment variables before starting bot"""
+    if not BOT_TOKEN:
+        print("❌ ERROR: BOT_TOKEN environment variable is required!")
+        sys.exit(1)
+    if not DATABASE_URL:
+        print("❌ ERROR: DATABASE_URL environment variable is required!")
+        sys.exit(1)
+    print("=" * 50)
+    print("🚀 Starting AU Dating Bot...")
+    print(f"✅ Bot token: {BOT_TOKEN[:10]}...")
+    print(f"✅ Database: {DATABASE_URL[:30]}...")
+    print(f"✅ Port: {PORT}")
+    print(f"✅ Channel verification: {'Enabled' if CHECK_CHANNEL else 'Disabled'}")
+    print("=" * 50)
 
 # Database connection pool
 logging.basicConfig(
@@ -55,8 +68,8 @@ logger = logging.getLogger(__name__)
 db_pool = None
 
 # ---------------- Database Functions ----------------
-async def init_db():
-    """Initialize PostgreSQL database tables with Supabase SSL support"""
+async def init_db(application=None):
+    """Initialize PostgreSQL database tables with flexible SSL support"""
     global db_pool
     
     print("=" * 50)
@@ -70,11 +83,19 @@ async def init_db():
     
     # Make a copy of the DATABASE_URL to modify
     db_url = DATABASE_URL
+    is_local = "localhost" in db_url or "127.0.0.1" in db_url
     
-    # For Supabase, we need to handle SSL differently
-    if "supabase" in db_url or "pooler.supabase.com" in db_url:
+    # SSL configuration: auto / require / disable
+    if DATABASE_SSL == "auto":
+        ssl_config = False if is_local else 'require'
+    elif DATABASE_SSL in ("false", "0", "disable", "no"):
+        ssl_config = False
+    else:
+        ssl_config = 'require'
+    
+    # For Supabase with SSL
+    if ("supabase" in db_url or "pooler.supabase.com" in db_url) and ssl_config:
         print("🔧 Configuring SSL for Supabase connection...")
-        # Remove any existing sslmode parameters
         if "?" in db_url:
             base_url = db_url.split("?")[0]
             params = db_url.split("?")[1].split("&")
@@ -83,17 +104,14 @@ async def init_db():
         else:
             base_url = db_url
         
-        # Add the correct SSL parameters
         if "?" in db_url:
             db_url += "&sslmode=require"
         else:
             db_url += "?sslmode=require"
-        
         print(f"✅ SSL configured for Supabase")
     
-    # Show partial URL for debugging
     safe_url = mask_database_url(db_url)
-    print(f"📦 Connecting to: {safe_url}")
+    print(f"📦 Connecting to: {safe_url} (ssl={ssl_config})")
     logger.info(f"Connecting to database: {safe_url}")
     
     max_retries = 3
@@ -104,7 +122,6 @@ async def init_db():
             print(f"Attempt {attempt + 1}/{max_retries}...")
             logger.info(f"Database connection attempt {attempt + 1}/{max_retries}")
             
-            # Create connection pool with SSL disabled for certificate verification
             db_pool = await asyncpg.create_pool(
                 dsn=db_url,
                 min_size=1,
@@ -113,7 +130,7 @@ async def init_db():
                 command_timeout=60,
                 timeout=30,
                 statement_cache_size=0,
-                ssl='require'  # Changed from True to 'require' which doesn't verify certs
+                ssl=ssl_config
             )
             
             # Test the connection
@@ -144,6 +161,15 @@ async def init_db():
                 print("❌ Max retries reached. Could not initialize database.")
                 logger.error("Max retries reached. Could not initialize database.")
                 raise
+
+async def close_db(application=None):
+    """Close PostgreSQL database connection pool"""
+    global db_pool
+    if db_pool:
+        print("🔄 Closing database connection pool...")
+        await db_pool.close()
+        db_pool = None
+        print("✅ Database connection pool closed.")
 
 def mask_database_url(url):
     """Mask password in database URL for safe logging"""
@@ -189,6 +215,18 @@ async def create_tables():
         )
         """)
         print("  ✅ swipes table")
+
+        # Passes table - stores users skipped during search so they are not shown twice
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS passes (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            passed_id BIGINT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(user_id, passed_id)
+        )
+        """)
+        print("  ✅ passes table")
         
         # Active chats table - stores currently active conversations
         await conn.execute("""
@@ -409,7 +447,9 @@ async def debug_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- Channel Check ----------------
 async def check_channel_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Check if user is a member of the required channel"""
+    """Check if user is a member of the required channel (optional based on CHECK_CHANNEL)"""
+    if not CHECK_CHANNEL or not CHANNEL_USERNAME:
+        return True
     try:
         chat_member = await context.bot.get_chat_member(CHANNEL_USERNAME, user_id)
         return chat_member.status in ['member', 'administrator', 'creator']
@@ -913,6 +953,16 @@ async def chat_relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
     
+    # Check if admin is searching for a user
+    if 'admin_searching' in context.user_data and user_id == ADMIN_USER_ID:
+        await admin_handle_search(update, context)
+        return
+
+    # Check if user is submitting a report reason
+    if 'reporting_user_id' in context.user_data:
+        await report_reason(update, context)
+        return
+
     # Check if user is in edit mode first
     if 'editing_existing' in context.user_data:
         # Handle text edit instead
@@ -976,9 +1026,33 @@ async def photo_relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- Report System ----------------
 async def report_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start report process"""
+    """Start report process or handle direct /report <id> <reason>"""
     user_id = update.effective_user.id
     
+    # Handle direct command: /report <user_id> <reason>
+    if context.args and len(context.args) >= 2:
+        try:
+            reported_id = int(context.args[0])
+            reason = " ".join(context.args[1:]).strip()
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO reports (reporter_id, reported_id, reason) VALUES ($1, $2, $3)",
+                    user_id, reported_id, reason
+                )
+            await update.message.reply_text("✅ Report submitted successfully. Thank you.")
+            if ADMIN_USER_ID:
+                try:
+                    await context.bot.send_message(
+                        chat_id=ADMIN_USER_ID,
+                        text=f"<b>🚨 NEW USER REPORT</b>\n\n<b>👤 Reporter:</b> {user_id}\n<b>⚠️ Reported User:</b> {reported_id}\n<b>📝 Reason:</b> {reason}\n\nUse /admin to review.",
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
+            return
+        except ValueError:
+            pass
+
     # Check if user is in a chat
     async with db_pool.acquire() as conn:
         chat_row = await conn.fetchrow("SELECT partner_id FROM active_chats WHERE user_id = $1", user_id)
@@ -989,33 +1063,33 @@ async def report_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "<b>⚠️ REPORTING USER</b>\n\n"
                 "You are about to report the user you're currently chatting with.\n"
-                "Please describe the reason for your report:",
+                "Please send a message describing the reason for your report:",
                 parse_mode="HTML"
             )
-            return REPORT_REASON
+            return
     
     await update.message.reply_text(
         "<b>📢 REPORT A USER</b>\n\n"
-        "To report a user, please use this command:\n"
-        "/report <user_id> <reason>\n\n"
-        "Or if you're in a chat with someone, just use /report and describe the issue.",
+        "To report a user, please use:\n"
+        "<code>/report &lt;user_id&gt; &lt;reason&gt;</code>\n\n"
+        "Or if you are currently chatting with someone, use /report to report them directly.",
         parse_mode="HTML"
     )
-    return ConversationHandler.END
 
 async def report_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Get report reason and process it"""
     reason = update.message.text.strip()
     user_id = update.effective_user.id
-    reported_id = context.user_data.get('reporting_user_id')
+    reported_id = context.user_data.pop('reporting_user_id', None)
     
     if not reported_id:
         await update.message.reply_text("❌ Could not identify the user to report.")
-        return ConversationHandler.END
+        return
     
     if len(reason) > 500:
-        await update.message.reply_text("❌ Reason too long! Max 500 characters.")
-        return REPORT_REASON
+        context.user_data['reporting_user_id'] = reported_id
+        await update.message.reply_text("❌ Reason too long! Max 500 characters. Please send a shorter reason:")
+        return
     
     # Save report to database
     async with db_pool.acquire() as conn:
@@ -1039,14 +1113,13 @@ async def report_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=admin_message, 
                 parse_mode="HTML"
             )
-        except:
+        except Exception:
             pass
     
     await update.message.reply_text(
         "✅ Thank you for your report. We will review it and take appropriate action.\n\n"
         "If this was an emergency, please contact the administration directly."
     )
-    return ConversationHandler.END
 
 # ---------------- Profile Management ----------------
 async def set_preference(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1061,7 +1134,8 @@ async def set_preference(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("Show Males 👨", callback_data="pref_Male")],
         [InlineKeyboardButton("Show Females 👩", callback_data="pref_Female")],
-        [InlineKeyboardButton("Show Both ", callback_data="pref_Both")]
+        [InlineKeyboardButton("Show Both 👫", callback_data="pref_Both")],
+        [InlineKeyboardButton("🔄 Reset Passed Profiles", callback_data="reset_passes")]
     ]
     await update.message.reply_text("Who do you want to meet?", reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -1075,6 +1149,19 @@ async def save_preference(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer()
     await query.edit_message_text(f"✅ Preference updated! I will now show you: {pref}")
+
+async def reset_passes_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Allow user to reset their passed profiles to browse them again"""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM passes WHERE user_id = $1", user_id)
+        
+    context.user_data.pop('current_viewed_profile_id', None)
+    context.user_data.pop('skipped_ids', None)
+    await query.edit_message_text("✅ Passed profiles have been reset! You can now see them again with /find.")
 
 async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check if user is banned
@@ -1104,6 +1191,14 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if is_callback:
         await update.callback_query.answer()
+        if update.callback_query.data == "find_next":
+            prev_id = context.user_data.get('current_viewed_profile_id')
+            if prev_id:
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "INSERT INTO passes (user_id, passed_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                        user_id, prev_id
+                    )
 
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT preference FROM users WHERE telegram_id = $1", user_id)
@@ -1119,7 +1214,8 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Don't show:
         # - Banned users
-        # - Users already liked
+        # - Users already liked (swipes)
+        # - Users already skipped/passed (passes)
         # - Users currently in active chats
         if pref == "Both":
             query = """
@@ -1130,6 +1226,9 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
             AND u.telegram_id != $1
             AND u.telegram_id NOT IN (
                 SELECT liked_id FROM swipes WHERE liker_id = $1
+            )
+            AND u.telegram_id NOT IN (
+                SELECT passed_id FROM passes WHERE user_id = $1
             )
             AND u.telegram_id NOT IN (
                 SELECT user_id FROM active_chats 
@@ -1151,6 +1250,9 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 SELECT liked_id FROM swipes WHERE liker_id = $2
             )
             AND u.telegram_id NOT IN (
+                SELECT passed_id FROM passes WHERE user_id = $2
+            )
+            AND u.telegram_id NOT IN (
                 SELECT user_id FROM active_chats 
                 UNION 
                 SELECT partner_id FROM active_chats
@@ -1163,17 +1265,22 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
         match = await conn.fetchrow(query, *params)
 
     if not match:
-        text = f"😔 No new profiles matching your preference ({pref}) right now."
+        text = (
+            f"😔 No new profiles matching your preference ({pref}) right now.\n\n"
+            "Check back later as new members join, or use /settings to reset your passed profiles."
+        )
         if is_callback:
-            if update.callback_query.message.photo:
-                await update.callback_query.edit_message_caption(caption=text)
-            else:
-                await update.callback_query.edit_message_text(text=text)
+            try:
+                await update.callback_query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            await update.callback_query.message.reply_text(text)
         else:
             await update.message.reply_text(text)
         return
 
     match_id = match['telegram_id']
+    context.user_data['current_viewed_profile_id'] = match_id
     name = match['name']
     gender = match['gender']
     campus = match['campus']
@@ -1198,24 +1305,21 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
 
     if is_callback:
+        # DO NOT delete previously shown message; remove its buttons so it stays in chat history
         try:
-            await update.callback_query.message.delete()
-            if photo:
-                await context.bot.send_photo(
-                    chat_id=user_id, 
-                    photo=photo, 
-                    caption=text, 
-                    reply_markup=keyboard,
-                    parse_mode="HTML"
-                )
-            else:
-                await context.bot.send_message(
-                    chat_id=user_id, 
-                    text=text, 
-                    reply_markup=keyboard,
-                    parse_mode="HTML"
-                )
-        except:
+            await update.callback_query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+            
+        if photo:
+            await context.bot.send_photo(
+                chat_id=user_id, 
+                photo=photo, 
+                caption=text, 
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+        else:
             await context.bot.send_message(
                 chat_id=user_id, 
                 text=text, 
@@ -1308,8 +1412,15 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reported_id = int(query.data.split('_')[1])
         context.user_data['reporting_user_id'] = reported_id
         
-        await query.edit_message_caption(caption="⚠️ Please describe the reason for reporting this user:")
-        return REPORT_REASON
+        prompt_text = "⚠️ Please send a message describing the reason for reporting this user:"
+        try:
+            if query.message.photo:
+                await query.edit_message_caption(caption=prompt_text)
+            else:
+                await query.edit_message_text(text=prompt_text)
+        except Exception:
+            await query.message.reply_text(prompt_text)
+        return
     
     user_id = update.effective_user.id 
     liked_id = int(query.data.split('_')[1]) 
@@ -1317,6 +1428,8 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with db_pool.acquire() as conn:
         # Insert the like
         await conn.execute("INSERT INTO swipes (liker_id, liked_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", user_id, liked_id)
+        # Remove from passes if it was there
+        await conn.execute("DELETE FROM passes WHERE user_id = $1 AND passed_id = $2", user_id, liked_id)
 
         # Check if it's a match (the liked user already liked the current user)
         is_match = await conn.fetchrow("SELECT 1 FROM swipes WHERE liker_id = $1 AND liked_id = $2", liked_id, user_id)
@@ -1365,8 +1478,11 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💬 Start Chatting", callback_data=f"chat_{liked_id}")]])
         )
     else:
-        # Not a match yet - just update the current message and notify the liked user
-        await query.edit_message_caption(caption="⚡ Like sent! Looking for more...")
+        # Not a match yet - remove buttons on the previous card so it stays in chat history
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
         
         # Send notification to the liked user that someone liked them
         try:
@@ -2296,9 +2412,9 @@ async def show_broadcast_preview(update: Update, context: ContextTypes.DEFAULT_T
         print(f"❌ Error sending preview: {e}")
         await update.message.reply_text(f"❌ Error: {e}")
 
-async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Confirm and send broadcast to all users"""
-    print("✅ broadcast_confirm called!")
+async def broadcast_wizard_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Confirm and send wizard broadcast to all users"""
+    print("✅ broadcast_wizard_confirm called!")
     query = update.callback_query
     await query.answer()
     
@@ -2418,9 +2534,9 @@ async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
-async def broadcast_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel broadcast"""
-    print("❌ broadcast_cancel called")
+async def broadcast_wizard_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel wizard broadcast"""
+    print("❌ broadcast_wizard_cancel called")
     query = update.callback_query
     await query.answer()
     
@@ -2795,8 +2911,8 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Confirm and send broadcast"""
+async def broadcast_reply_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Confirm and send reply-based broadcast"""
     query = update.callback_query
     await query.answer()
     
@@ -2865,8 +2981,8 @@ async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("✅ Broadcast completed.")
     context.user_data.clear()
 
-async def broadcast_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel broadcast"""
+async def broadcast_reply_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel reply-based broadcast"""
     query = update.callback_query
     await query.answer()
     
@@ -3099,6 +3215,7 @@ async def handle_request_action(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
 # ---------------- Conversation Handler ----------------
+# ---------------- Conversation Handler ----------------
 conv_handler = ConversationHandler(
     entry_points=[CommandHandler('start', start)],
     states={
@@ -3116,18 +3233,18 @@ conv_handler = ConversationHandler(
         EDIT_CAMPUS: [CallbackQueryHandler(edit_campus_input)],
         EDIT_PHOTO: [MessageHandler(filters.PHOTO, edit_photo_input), CallbackQueryHandler(edit_photo_input, pattern="^skip$")],
         EDIT_BIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_bio_input), CallbackQueryHandler(edit_bio_input, pattern="^skip$")],
-        EDIT_HOBBIES: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_hobbies_input), CallbackQueryHandler(edit_hobbies_input, pattern="^skip$")],
-        REPORT_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, report_reason)]
+        EDIT_HOBBIES: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_hobbies_input), CallbackQueryHandler(edit_hobbies_input, pattern="^skip$")]
     },
     fallbacks=[CommandHandler('cancel', cancel)],
     per_message=False
 )
 
-# ---------------- MAIN FUNCTION - WEBHOOK VERSION ----------------
+# ---------------- MAIN FUNCTION (POLLING & WEBHOOK DUAL-MODE) ----------------
 async def main():
-    """Main function using webhook (recommended for Render)"""
+    """Main bot entrypoint supporting both long-polling and webhook mode"""
+    validate_config()
     
-    # Initialize database FIRST
+    # Initialize database
     print("🔄 Initializing database...")
     try:
         await init_db()
@@ -3135,35 +3252,17 @@ async def main():
     except Exception as e:
         print(f"❌ Failed to initialize database: {e}")
         return
-    
-    # Get Render URL from environment
-    RENDER_URL = os.getenv("RENDER_URL")
-    if not RENDER_URL:
-        print("❌ ERROR: RENDER_URL environment variable is required for webhook mode!")
-        print("Please add it in Render dashboard: https://au-university-dating-telegram-bot.onrender.com")
-        return
-    
-    # Remove any trailing slash
-    RENDER_URL = RENDER_URL.rstrip('/')
-    
-    WEBHOOK_PATH = "/webhook"
-    WEBHOOK_URL = f"{RENDER_URL}{WEBHOOK_PATH}"
-    
-    print(f"🌐 Configured webhook URL: {WEBHOOK_URL}")
-    print(f"🔍 To test manually, visit: {RENDER_URL}/health")
-    print(f"🔍 For debug info, visit: {RENDER_URL}/test")
-    
+
     # Create Telegram application
-    print("🤖 Creating Telegram bot application...")
+    print("🤖 Building Telegram bot application...")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Add all handlers (keep ALL your existing handlers here)
-    print("🔧 Adding handlers...")
+    print("🔧 Registering handlers...")
     
-    # Conversation handler for registration
+    # Registration conversation handler
     app.add_handler(conv_handler)
     
-    # Basic commands
+    # Commands
     app.add_handler(CommandHandler("find", find_match))
     app.add_handler(CommandHandler("myprofile", show_my_profile))
     app.add_handler(CommandHandler("settings", set_preference))
@@ -3174,30 +3273,30 @@ async def main():
     app.add_handler(CommandHandler("debug", debug_db))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
 
-# Add these with your other callback query handlers
-
-
     # Callback query handlers
     app.add_handler(CallbackQueryHandler(handle_like, pattern="^(like_|report_)"))
     app.add_handler(CallbackQueryHandler(start_chat, pattern="^chat_"))
     app.add_handler(CallbackQueryHandler(find_match, pattern="find_next"))
     app.add_handler(CallbackQueryHandler(save_preference, pattern="^pref_"))
+    app.add_handler(CallbackQueryHandler(reset_passes_callback, pattern="^reset_passes$"))
     app.add_handler(CallbackQueryHandler(start_edit_profile, pattern="^start_edit_profile$"))
     app.add_handler(CallbackQueryHandler(handle_edit_existing, pattern="^edit_(name|gender|campus|photo|bio|hobbies)_existing$"))
     app.add_handler(CallbackQueryHandler(handle_save_edit, pattern="^(save_gender_|save_campus_|skip_)"))
     app.add_handler(CallbackQueryHandler(finish_edit, pattern="^finish_edit$"))
     app.add_handler(CallbackQueryHandler(check_channel_callback, pattern="^check_channel$"))
-    app.add_handler(CallbackQueryHandler(broadcast_confirm, pattern="^confirm_broadcast$"))
-    app.add_handler(CallbackQueryHandler(broadcast_cancel, pattern="^cancel_broadcast$"))
     
-    # Admin callbacks - Basic
+    # Broadcast callback handlers (separated to prevent collisions)
+    app.add_handler(CallbackQueryHandler(broadcast_reply_confirm, pattern="^confirm_broadcast$"))
+    app.add_handler(CallbackQueryHandler(broadcast_reply_cancel, pattern="^cancel_broadcast$"))
+    app.add_handler(CallbackQueryHandler(broadcast_wizard_confirm, pattern="^broadcast_confirm$"))
+    app.add_handler(CallbackQueryHandler(broadcast_wizard_cancel, pattern="^broadcast_cancel$"))
+    
+    # Admin callbacks
     app.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
     app.add_handler(CallbackQueryHandler(admin_reports, pattern="^admin_reports$"))
     app.add_handler(CallbackQueryHandler(admin_broadcast, pattern="^admin_broadcast$"))
     app.add_handler(CallbackQueryHandler(admin_back, pattern="^admin_back$"))
     app.add_handler(CallbackQueryHandler(admin_handle_report, pattern="^(approve_|reject_)"))
-    
-    # Admin callbacks - Enhanced User Management
     app.add_handler(CallbackQueryHandler(admin_users, pattern="^admin_users$"))
     app.add_handler(CallbackQueryHandler(admin_list_users, pattern="^admin_list_users$"))
     app.add_handler(CallbackQueryHandler(admin_users_page, pattern="^admin_users_page_"))
@@ -3206,12 +3305,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(admin_unban_user, pattern="^admin_unban_"))
     app.add_handler(CallbackQueryHandler(admin_banned_users, pattern="^admin_banned_users$"))
     app.add_handler(CallbackQueryHandler(admin_search_user, pattern="^admin_search_user$"))
-    
-    # Admin callbacks - Enhanced Broadcast
     app.add_handler(CallbackQueryHandler(admin_broadcast_menu, pattern="^admin_broadcast_menu$"))
-
-    
-    # Admin callbacks - System Logs
     app.add_handler(CallbackQueryHandler(admin_logs, pattern="^admin_logs$"))
     
     # Chat request handlers
@@ -3223,15 +3317,11 @@ async def main():
     app.add_handler(MessageHandler(filters.Regex("^⚙️ Settings$"), set_preference))
     app.add_handler(MessageHandler(filters.Regex("^📢 Report User$"), report_user))
 
-    # Message handlers
+    # Message handlers (chat_relay delegates to edit, search, and report when active)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_relay))
     app.add_handler(MessageHandler(filters.PHOTO, photo_relay))
     
-    # Admin search handler
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_handle_search))
-    
-    # Create broadcast conversation handler
-        # Create broadcast conversation handler
+    # Broadcast conversation wizard handler
     broadcast_conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(broadcast_start, pattern="^broadcast_")],
         states={
@@ -3246,208 +3336,131 @@ async def main():
         per_message=False,
         name="broadcast_conversation"
     )
-    
     app.add_handler(broadcast_conv_handler)
     
-    print("✅ All handlers added!")
+    print("✅ All handlers registered!")
     print(f"👑 Admin User ID: {ADMIN_USER_ID if ADMIN_USER_ID else 'Not set'}")
-    print(f"📢 Channel: {CHANNEL_USERNAME}")
+    print(f"📢 Channel: {CHANNEL_USERNAME if CHANNEL_USERNAME else 'None'}")
     
-    # CRITICAL FIX: Initialize the application BEFORE setting webhook
-    print("🔧 Initializing application...")
-    await app.initialize()
-    print("✅ Application initialized!")
+    # Decide between Webhook and Polling mode
+    is_webhook_mode = bool(RENDER_URL) and USE_WEBHOOK != "false"
     
-    # Set up webhook with verification
-    print("🔧 Setting webhook...")
-    
-    # Delete any existing webhook first
-    delete_result = await app.bot.delete_webhook(drop_pending_updates=True)
-    print(f"✅ Delete webhook result: {delete_result}")
-    
-    # Set the new webhook
-    set_result = await app.bot.set_webhook(
-        url=WEBHOOK_URL,
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-        max_connections=40
-    )
-    print(f"✅ Set webhook result: {set_result}")
-    
-    # Verify webhook was set correctly
-    webhook_info = await app.bot.get_webhook_info()
-    print(f"📊 Webhook info:")
-    print(f"   URL: {webhook_info.url}")
-    print(f"   Pending updates: {webhook_info.pending_update_count}")
-    print(f"   Max connections: {webhook_info.max_connections}")
-    
-    if webhook_info.url != WEBHOOK_URL:
-        print(f"⚠️ Warning: Webhook URL mismatch!")
-        print(f"   Expected: {WEBHOOK_URL}")
-        print(f"   Actual: {webhook_info.url}")
-    
-    # Start webhook server
-    print(f"🌐 Starting webhook server on port {PORT}...")
-    
-    # Create aiohttp web application
-    web_app = web.Application()
-    
-    # Health check endpoint
-    async def handle_health(request):
-        return web.Response(text="Bot is healthy")
-    
-    # ENHANCED DEBUG WEBHOOK HANDLER
-    async def handle_webhook(request):
-        """Handle incoming updates from Telegram with comprehensive error logging"""
-        print("=" * 60)
-        print(f"📨 WEBHOOK TRIGGERED at {datetime.now()}")
-        print(f"Method: {request.method}")
-        print(f"Path: {request.path}")
-        print(f"Headers: {dict(request.headers)}")
-
-        try:
-            # 1. Read the raw body first
-            body = await request.read()
-            body_str = body.decode('utf-8')
-            print(f"Raw Body (first 500 chars): {body_str[:500]}")
-
-            # 2. Parse JSON
-            import json
-            data = json.loads(body_str)
-            print(f"Parsed JSON keys: {list(data.keys())}")
-
-            # 3. Confirm it's a Telegram update
-            if 'update_id' in data:
-                print(f"✅ Valid Telegram Update ID: {data['update_id']}")
-
-                # 4. Create Update object and process
-                update = Update.de_json(data, app.bot)
-                print(f"✅ Update object created. Processing now...")
-                await app.process_update(update)
-                print(f"✅ Update processed successfully.")
-
-            else:
-                print(f"⚠️ Received data is not a Telegram update.")
-
-            print(f"✅ Sending 200 OK response to Telegram.")
-            print("=" * 60)
-            return web.Response(status=200, text="OK")
-
-        except json.JSONDecodeError as e:
-            error_msg = f"❌ JSON Decode Error: {e}"
-            print(error_msg)
-            print("=" * 60)
-            return web.Response(status=500, text=error_msg)
-
-        except Exception as e:
-            error_msg = f"❌ UNEXPECTED ERROR in webhook: {type(e).__name__}: {e}"
-            print(error_msg)
-            import traceback
-            traceback.print_exc()
-            print("=" * 60)
-            # Return the error message in the response for debugging
-            return web.Response(status=500, text=error_msg)
-    
-    # Test endpoint to verify server is working
-    async def handle_test(request):
-        """Test endpoint to verify server is accessible"""
-        try:
-            bot_info = await app.bot.get_me()
-            return web.json_response({
-                "status": "running",
-                "time": str(datetime.now()),
-                "bot_name": bot_info.first_name,
-                "bot_username": bot_info.username,
-                "bot_id": bot_info.id,
-                "webhook_url": WEBHOOK_URL,
-                "endpoints": {
-                    "webhook": WEBHOOK_PATH,
-                    "health": "/health",
-                    "test": "/test",
-                    "root": "/"
-                }
-            })
-        except Exception as e:
-            return web.json_response({
-                "status": "error",
-                "error": str(e),
-                "time": str(datetime.now())
-            }, status=500)
-    
-    # Root endpoint
-    async def handle_root(request):
-        return web.Response(
-            text="🤖 AU Dating Bot is running. Use /health for status, /test for debug info.",
-            content_type="text/plain"
+    if is_webhook_mode:
+        # ---------------- WEBHOOK MODE (Cloud / Render) ----------------
+        render_clean_url = RENDER_URL.rstrip('/')
+        webhook_path = "/webhook"
+        webhook_url = f"{render_clean_url}{webhook_path}"
+        
+        print(f"🌐 Running in WEBHOOK mode with URL: {webhook_url}")
+        
+        await app.initialize()
+        await app.start()
+        
+        # Configure webhook
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        await app.bot.set_webhook(
+            url=webhook_url,
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            max_connections=40
         )
-    
-    # Add all routes
-    web_app.router.add_post(WEBHOOK_PATH, handle_webhook)
-    web_app.router.add_get('/', handle_root)
-    web_app.router.add_get('/health', handle_health)
-    web_app.router.add_get('/test', handle_test)
-    
-    # Verify all endpoints are registered (FIXED VERSION)
-    print("📋 Registered routes:")
-    for route in web_app.router.routes():
-        # Get the path safely for different aiohttp versions
+        
+        # Web server
+        web_app = web.Application()
+        
+        async def handle_health(request):
+            return web.Response(text="Bot is healthy")
+        
+        async def handle_webhook(request):
+            try:
+                body = await request.read()
+                data = json.loads(body.decode('utf-8'))
+                if 'update_id' in data:
+                    update = Update.de_json(data, app.bot)
+                    await app.process_update(update)
+                return web.Response(status=200, text="OK")
+            except Exception as e:
+                logger.error(f"Webhook error: {e}")
+                return web.Response(status=500, text=str(e))
+        
+        async def handle_test(request):
+            try:
+                bot_info = await app.bot.get_me()
+                return web.json_response({
+                    "status": "running",
+                    "mode": "webhook",
+                    "time": str(datetime.now()),
+                    "bot_name": bot_info.first_name,
+                    "bot_username": bot_info.username,
+                    "webhook_url": webhook_url
+                })
+            except Exception as e:
+                return web.json_response({"status": "error", "error": str(e)}, status=500)
+        
+        web_app.router.add_post(webhook_path, handle_webhook)
+        web_app.router.add_get('/', lambda r: web.Response(text="🤖 AU Dating Bot is running."))
+        web_app.router.add_get('/health', handle_health)
+        web_app.router.add_get('/test', handle_test)
+        
+        runner = web.AppRunner(web_app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', PORT)
+        await site.start()
+        
+        bot_info = await app.bot.get_me()
+        print("=" * 50)
+        print("🎉 AU DATING BOT IS RUNNING WITH WEBHOOK!")
+        print(f"🤖 Bot: @{bot_info.username} ({bot_info.first_name})")
+        print(f"📱 Webhook URL: {webhook_url}")
+        print("=" * 50)
+        
         try:
-            if hasattr(route, 'resource') and hasattr(route.resource, '_path'):
-                path = route.resource._path
-            elif hasattr(route, 'get_info'):
-                info = route.get_info()
-                path = info.get('path', info.get('formatter', 'unknown'))
-            elif hasattr(route, 'path'):
-                path = route.path
-            else:
-                path = str(route)
-            print(f"   {route.method} {path}")
-        except Exception as e:
-            print(f"   {route.method} - Error getting path: {e}")
+            await asyncio.Event().wait()
+        except (KeyboardInterrupt, SystemExit):
+            print("\n👋 Shutting down webhook bot...")
+        finally:
+            print("🔄 Cleaning up resources...")
+            await app.bot.delete_webhook()
+            await app.stop()
+            await app.shutdown()
+            await runner.cleanup()
+            await close_db()
+            print("✅ Webhook shutdown complete!")
     
-    # Start the web server
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    
-    print(f"✅ Webhook server running on port {PORT}")
-    
-    # Get bot info
-    bot_info = await app.bot.get_me()
-    print(f"✅ Bot info:")
-    print(f"   Name: {bot_info.first_name}")
-    print(f"   Username: @{bot_info.username}")
-    print(f"   ID: {bot_info.id}")
-    
-    print("=" * 50)
-    print("🎉 AU DATING BOT IS RUNNING WITH WEBHOOK!")
-    print(f"📱 Webhook URL: {WEBHOOK_URL}")
-    print(f"💡 Health check: {RENDER_URL}/health")
-    print(f"🔧 Test endpoint: {RENDER_URL}/test")
-    print(f"📝 To test manually, send a POST request to {WEBHOOK_URL}")
-    print("=" * 50)
-    
-    # Keep the bot running
-    try:
-        # Keep the script alive
-        await asyncio.Event().wait()
-    except KeyboardInterrupt:
-        print("\n👋 Shutting down gracefully...")
-    except Exception as e:
-        print(f"❌ Unexpected error: {e}")
-    finally:
-        # Clean shutdown
-        print("🔄 Cleaning up...")
-        await app.bot.delete_webhook()
-        await app.stop()
-        await app.shutdown()
-        await runner.cleanup()
-        print("✅ Shutdown complete!")
+    else:
+        # ---------------- POLLING MODE (Local Development) ----------------
+        print("🚀 Running in POLLING mode (no RENDER_URL detected)...")
+        await app.initialize()
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        await app.start()
+        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+        
+        bot_info = await app.bot.get_me()
+        print("=" * 50)
+        print("🎉 AU DATING BOT IS RUNNING IN POLLING MODE!")
+        print(f"🤖 Bot: @{bot_info.username} ({bot_info.first_name})")
+        print("💬 Send /start to your bot in Telegram to test.")
+        print("🛑 Press Ctrl+C in this terminal to stop.")
+        print("=" * 50)
+        
+        try:
+            await asyncio.Event().wait()
+        except (KeyboardInterrupt, SystemExit):
+            print("\n👋 Shutting down polling bot...")
+        finally:
+            print("🔄 Cleaning up resources...")
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
+            await close_db()
+            print("✅ Polling shutdown complete!")
+
 # Start the bot
 if __name__ == "__main__":
     try:
         asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("\n👋 Bot stopped.")
     except Exception as e:
         print(f"❌ Fatal error starting bot: {e}")
         import traceback
