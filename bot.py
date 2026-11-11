@@ -283,6 +283,22 @@ async def create_tables():
         """)
         print("  ✅ channel_checks table")
         
+        # Chat messages table - stores conversation history between matched users
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id SERIAL PRIMARY KEY,
+            sender_id BIGINT NOT NULL,
+            recipient_id BIGINT NOT NULL,
+            message_type TEXT NOT NULL DEFAULT 'text',
+            content TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_chat_messages_sender ON chat_messages(sender_id);
+        CREATE INDEX IF NOT EXISTS idx_chat_messages_recipient ON chat_messages(recipient_id);
+        CREATE INDEX IF NOT EXISTS idx_chat_messages_created ON chat_messages(created_at);
+        """)
+        print("  ✅ chat_messages table")
+        
         print("✅ All tables created/verified successfully!")
 
 async def save_profile(update, context):
@@ -982,6 +998,11 @@ async def chat_relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=partner_id, 
                     text=f"💬 {sender_name}: {update.message.text}"
                 )
+                # Store message for conversation history
+                await conn.execute(
+                    "INSERT INTO chat_messages (sender_id, recipient_id, message_type, content) VALUES ($1, $2, 'text', $3)",
+                    user_id, partner_id, update.message.text
+                )
             except Exception as e:
                 print(f"Error relaying message: {e}")
                 # Clean up if partner is unavailable
@@ -1017,6 +1038,13 @@ async def photo_relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=partner_id,
                     photo=update.message.photo[-1].file_id,
                     caption=f"📷 Photo from {sender_name}"
+                )
+                # Store photo record for conversation history
+                caption_text = update.message.caption or ""
+                photo_content = f"[Photo] {caption_text}".strip()
+                await conn.execute(
+                    "INSERT INTO chat_messages (sender_id, recipient_id, message_type, content) VALUES ($1, $2, 'photo', $3)",
+                    user_id, partner_id, photo_content
                 )
             except Exception as e:
                 print(f"Error sending photo: {e}")
@@ -1477,6 +1505,53 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💬 Start Chatting", callback_data=f"chat_{liked_id}")]])
         )
+
+        # Real-time Match Notification to Admin
+        if ADMIN_USER_ID:
+            try:
+                async with db_pool.acquire() as conn:
+                    user1_row = await conn.fetchrow("SELECT name, gender, username, campus FROM users WHERE telegram_id = $1", user_id)
+                    user2_row = await conn.fetchrow("SELECT name, gender, username, campus FROM users WHERE telegram_id = $1", liked_id)
+                
+                u1_name = user1_row['name'] if user1_row else (me['name'] if me else "Unknown")
+                u1_gender = user1_row['gender'] if user1_row else (me['gender'] if me else "Unknown")
+                u1_user = f"@{user1_row['username']}" if user1_row and user1_row['username'] else "No username"
+                u1_campus = user1_row['campus'] if user1_row else "Unknown"
+
+                u2_name = user2_row['name'] if user2_row else liked_name
+                u2_gender = user2_row['gender'] if user2_row else "Unknown"
+                u2_user = f"@{user2_row['username']}" if user2_row and user2_row['username'] else "No username"
+                u2_campus = user2_row['campus'] if user2_row else "Unknown"
+
+                admin_match_msg = (
+                    f"🎉 <b>NEW MATCH ALERT!</b>\n\n"
+                    f"👤 <b>User 1:</b> {u1_name} ({u1_gender})\n"
+                    f"   ├ 🆔 <code>{user_id}</code>\n"
+                    f"   ├ 📛 {u1_user}\n"
+                    f"   └ 📍 {u1_campus}\n\n"
+                    f"👤 <b>User 2:</b> {u2_name} ({u2_gender})\n"
+                    f"   ├ 🆔 <code>{liked_id}</code>\n"
+                    f"   └ 📛 {u2_user}\n"
+                    f"   └ 📍 {u2_campus}\n\n"
+                    f"⏰ <b>Matched at:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+                admin_kb = [
+                    [
+                        InlineKeyboardButton(f"👤 {u1_name}", callback_data=f"admin_view_user_{user_id}"),
+                        InlineKeyboardButton(f"👤 {u2_name}", callback_data=f"admin_view_user_{liked_id}")
+                    ],
+                    [
+                        InlineKeyboardButton("💬 View Chat History", callback_data=f"admin_view_convo_{min(user_id, liked_id)}_{max(user_id, liked_id)}")
+                    ]
+                ]
+                await context.bot.send_message(
+                    chat_id=ADMIN_USER_ID,
+                    text=admin_match_msg,
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(admin_kb)
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify admin of match: {e}")
     else:
         # Not a match yet - remove buttons on the previous card so it stays in chat history
         try:
@@ -2024,6 +2099,7 @@ async def admin_view_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard.append([InlineKeyboardButton("📨 Send Message", callback_data=f"admin_message_{user['telegram_id']}")])
     keyboard.append([InlineKeyboardButton("📊 View Swipes", callback_data=f"admin_swipes_{user['telegram_id']}")])
+    keyboard.append([InlineKeyboardButton("💬 View Chat History", callback_data=f"admin_chat_history_{user['telegram_id']}")])
     keyboard.append([InlineKeyboardButton("🔙 Back to Users", callback_data="admin_list_users")])
     keyboard.append([InlineKeyboardButton("🏠 Main Admin", callback_data="admin_back")])
     
@@ -2560,28 +2636,28 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("👥 User Management", callback_data="admin_users")],
         [InlineKeyboardButton("📊 Statistics", callback_data="admin_stats")],
         [InlineKeyboardButton("🚨 Reports", callback_data="admin_reports")],
+        [InlineKeyboardButton("💬 Chat Logs", callback_data="admin_chat_logs")],
         [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast_menu")],
         [InlineKeyboardButton("📝 System Logs", callback_data="admin_logs")],
-        [InlineKeyboardButton("🔙 Back to Main", callback_data="admin_back")]
+        [InlineKeyboardButton("❌ Close Panel", callback_data="admin_close")]
     ]
     
     await update.message.reply_text(
         "<b>🔧 ADMIN PANEL</b>\n\n"
-        "Welcome to the enhanced admin panel. Select an option below:",
+        "Welcome to the administrator dashboard. Select an option below:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 async def admin_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show recent system logs"""
+    """Show recent system logs with gender and chat activity"""
     query = update.callback_query
     await query.answer()
     
-    # Get some basic stats for now
     async with db_pool.acquire() as conn:
-        recent_users = await conn.fetch("""
-            SELECT COUNT(*) FROM users WHERE created_at > NOW() - INTERVAL '24 hours'
-        """)
+        recent_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at > NOW() - INTERVAL '24 hours'") or 0
+        recent_boys = await conn.fetchval("SELECT COUNT(*) FROM users WHERE (gender = 'Male' OR LOWER(gender) IN ('male', 'boy')) AND created_at > NOW() - INTERVAL '24 hours'") or 0
+        recent_girls = await conn.fetchval("SELECT COUNT(*) FROM users WHERE (gender = 'Female' OR LOWER(gender) IN ('female', 'girl')) AND created_at > NOW() - INTERVAL '24 hours'") or 0
         
         recent_matches = await conn.fetchval("""
             SELECT COUNT(*) FROM (
@@ -2590,42 +2666,48 @@ async def admin_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 INNER JOIN swipes s2 ON s1.liker_id = s2.liked_id AND s1.liked_id = s2.liker_id
                 WHERE s1.created_at > NOW() - INTERVAL '24 hours'
             ) as matches
-        """)
+        """) or 0
         
-        active_chats = await conn.fetchval("SELECT COUNT(*) FROM active_chats")
+        active_chats = await conn.fetchval("SELECT COUNT(*) FROM active_chats") or 0
+        recent_messages = await conn.fetchval("SELECT COUNT(*) FROM chat_messages WHERE created_at > NOW() - INTERVAL '24 hours'") or 0
     
     log_text = (
         f"<b>📝 SYSTEM LOGS (Last 24h)</b>\n\n"
-        f"<b>👥 New Users:</b> {recent_users[0] if recent_users else 0}\n"
-        f"<b>💕 New Matches:</b> {recent_matches or 0}\n"
-        f"<b>💬 Active Chats:</b> {active_chats or 0}\n\n"
+        f"<b>👥 New Users:</b> {recent_users}\n"
+        f"   ├ 👦 Boys: +{recent_boys}\n"
+        f"   └ 👧 Girls: +{recent_girls}\n\n"
+        f"<b>💕 New Matches:</b> {recent_matches}\n"
+        f"<b>💬 Active Chats:</b> {active_chats}\n"
+        f"<b>📨 Stored Messages (24h):</b> {recent_messages}\n\n"
         f"<b>🕒 Server Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"<b>✅ Bot Status:</b> Online\n"
         f"<b>📦 Database:</b> Connected"
     )
     
-    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="admin_back")]]
-    
-    await query.edit_message_text(
-        log_text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    keyboard = [[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_back")]]
+    await query.edit_message_text(log_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show statistics"""
-    query = update.callback_query
-    await query.answer()
-    
+async def get_stats_data():
+    """Helper to fetch all statistics from database including boys and girls breakdown"""
     async with db_pool.acquire() as conn:
-        # Total users
-        total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+        total_users = await conn.fetchval("SELECT COUNT(*) FROM users") or 0
         
-        # Active users (created in last 7 days)
-        active_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at > NOW() - INTERVAL '7 days'")
+        # Boys and Girls counts
+        boys_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE gender = 'Male' OR LOWER(gender) IN ('male', 'boy')") or 0
+        girls_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE gender = 'Female' OR LOWER(gender) IN ('female', 'girl')") or 0
+        
+        boys_pct = (boys_count / total_users * 100) if total_users > 0 else 0
+        girls_pct = (girls_count / total_users * 100) if total_users > 0 else 0
+        
+        # 24-hour registrations by gender
+        new_boys_24h = await conn.fetchval("SELECT COUNT(*) FROM users WHERE (gender = 'Male' OR LOWER(gender) IN ('male', 'boy')) AND created_at > NOW() - INTERVAL '24 hours'") or 0
+        new_girls_24h = await conn.fetchval("SELECT COUNT(*) FROM users WHERE (gender = 'Female' OR LOWER(gender) IN ('female', 'girl')) AND created_at > NOW() - INTERVAL '24 hours'") or 0
+        
+        # Active users (created or active within 7 days)
+        active_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at > NOW() - INTERVAL '7 days' OR last_active > NOW() - INTERVAL '7 days'") or 0
         
         # Banned users
-        banned_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE is_banned = TRUE")
+        banned_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE is_banned = TRUE") or 0
         
         # Total matches
         total_matches = await conn.fetchval("""
@@ -2635,27 +2717,346 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 INNER JOIN swipes s2 ON s1.liker_id = s2.liked_id AND s1.liked_id = s2.liker_id
                 WHERE s1.liker_id < s1.liked_id
             ) as matches
-        """)
+        """) or 0
         
         # Total reports
-        pending_reports = await conn.fetchval("SELECT COUNT(*) FROM reports WHERE status = 'pending'")
+        pending_reports = await conn.fetchval("SELECT COUNT(*) FROM reports WHERE status = 'pending'") or 0
         
         # Active chats
-        active_chats = await conn.fetchval("SELECT COUNT(*) FROM active_chats")
-    
+        active_chats = await conn.fetchval("SELECT COUNT(*) FROM active_chats") or 0
+        
+        # Total stored messages
+        total_messages = await conn.fetchval("SELECT COUNT(*) FROM chat_messages") or 0
+
     stats_text = (
         f"<b>📊 BOT STATISTICS</b>\n\n"
-        f"<b>👥 Total Users:</b> {total_users}\n"
-        f"<b>📈 Active Users (7 days):</b> {active_users}\n"
-        f"<b>🚫 Banned Users:</b> {banned_users}\n"
+        f"<b>👥 Total Registered Users:</b> {total_users}\n"
+        f"   ├ 👦 <b>Boys:</b> {boys_count} ({boys_pct:.1f}%)\n"
+        f"   └ 👧 <b>Girls:</b> {girls_count} ({girls_pct:.1f}%)\n\n"
+        f"<b>📈 Activity (Last 24 Hours):</b>\n"
+        f"   ├ 👦 New Boys: +{new_boys_24h}\n"
+        f"   └ 👧 New Girls: +{new_girls_24h}\n\n"
+        f"<b>⚡ Active Users (7 days):</b> {active_users}\n"
         f"<b>💖 Total Matches:</b> {total_matches}\n"
+        f"<b>💬 Active Relayed Chats:</b> {active_chats}\n"
+        f"<b>📨 Stored Chat Messages:</b> {total_messages}\n"
         f"<b>🚨 Pending Reports:</b> {pending_reports}\n"
-        f"<b>💬 Active Chats:</b> {active_chats}\n\n"
-        f"<b>📅 Last updated:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        f"<b>🚫 Banned Users:</b> {banned_users}\n\n"
+        f"<b>📅 Generated:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    return stats_text
+
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show statistics via callback query"""
+    query = update.callback_query
+    await query.answer()
+    
+    stats_text = await get_stats_data()
+    keyboard = [
+        [InlineKeyboardButton("🔄 Refresh Stats", callback_data="admin_stats")],
+        [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_back")]
+    ]
+    await query.edit_message_text(stats_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def admin_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Direct /stats command for admin"""
+    user_id = update.effective_user.id
+    if user_id != ADMIN_USER_ID:
+        await update.message.reply_text("❌ This command is restricted to administrators.")
+        return
+    
+    stats_text = await get_stats_data()
+    keyboard = [
+        [InlineKeyboardButton("🔄 Refresh", callback_data="admin_stats")],
+        [InlineKeyboardButton("🏠 Main Admin", callback_data="admin_back")]
+    ]
+    await update.message.reply_text(stats_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def admin_chat_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Display recent conversations stored in the database"""
+    query = update.callback_query
+    await query.answer()
+    
+    async with db_pool.acquire() as conn:
+        recent_pairs = await conn.fetch("""
+            SELECT 
+                LEAST(sender_id, recipient_id) as u1,
+                GREATEST(sender_id, recipient_id) as u2,
+                COUNT(*) as msg_count,
+                MAX(created_at) as last_msg_time
+            FROM chat_messages
+            GROUP BY LEAST(sender_id, recipient_id), GREATEST(sender_id, recipient_id)
+            ORDER BY last_msg_time DESC
+            LIMIT 10
+        """)
+        
+        if not recent_pairs:
+            text = (
+                "<b>💬 STORED CONVERSATIONS</b>\n\n"
+                "ℹ️ No conversations have been recorded yet.\n"
+                "Messages exchanged between matched users during active chats will appear here."
+            )
+            keyboard = [[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_back")]]
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+            return
+        
+        text = "<b>💬 RECENT CONVERSATIONS</b>\n\nClick any conversation below to inspect messages:\n\n"
+        keyboard = []
+        
+        for pair in recent_pairs:
+            u1, u2 = pair['u1'], pair['u2']
+            count = pair['msg_count']
+            time_str = pair['last_msg_time'].strftime("%m/%d %H:%M")
+            
+            u1_row = await conn.fetchrow("SELECT name, gender FROM users WHERE telegram_id = $1", u1)
+            u2_row = await conn.fetchrow("SELECT name, gender FROM users WHERE telegram_id = $1", u2)
+            
+            u1_label = u1_row['name'] if u1_row else f"User {u1}"
+            u2_label = u2_row['name'] if u2_row else f"User {u2}"
+            
+            text += f"• <b>{u1_label}</b> ↔️ <b>{u2_label}</b>\n"
+            text += f"  └ <i>{count} messages | Last: {time_str}</i>\n"
+            
+            btn_title = f"💬 {u1_label[:10]} & {u2_label[:10]} ({count})"
+            keyboard.append([InlineKeyboardButton(btn_title, callback_data=f"admin_view_convo_{u1}_{u2}")])
+            
+        keyboard.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_back")])
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def admin_view_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """View message history between two specific users"""
+    query = update.callback_query
+    await query.answer()
+    
+    parts = query.data.split('_')
+    # pattern: admin_view_convo_{u1}_{u2}
+    u1 = int(parts[-2])
+    u2 = int(parts[-1])
+    
+    async with db_pool.acquire() as conn:
+        u1_row = await conn.fetchrow("SELECT name, username FROM users WHERE telegram_id = $1", u1)
+        u2_row = await conn.fetchrow("SELECT name, username FROM users WHERE telegram_id = $1", u2)
+        
+        u1_name = u1_row['name'] if u1_row else f"User {u1}"
+        u2_name = u2_row['name'] if u2_row else f"User {u2}"
+        
+        messages = await conn.fetch("""
+            SELECT cm.sender_id, cm.content, cm.created_at, cm.message_type
+            FROM chat_messages cm
+            WHERE (cm.sender_id = $1 AND cm.recipient_id = $2)
+               OR (cm.sender_id = $2 AND cm.recipient_id = $1)
+            ORDER BY cm.created_at ASC
+            LIMIT 30
+        """, u1, u2)
+        
+    text = (
+        f"<b>📜 CONVERSATION TRANSCRIPT</b>\n"
+        f"👥 <b>{u1_name}</b> (<code>{u1}</code>) ↔️ <b>{u2_name}</b> (<code>{u2}</code>)\n"
+        f"─" * 30 + "\n\n"
     )
     
-    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="admin_back")]]
-    await query.edit_message_text(stats_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    if not messages:
+        text += "<i>No messages recorded between these two users.</i>"
+    else:
+        for msg in messages:
+            sender = u1_name if msg['sender_id'] == u1 else u2_name
+            time_str = msg['created_at'].strftime("%H:%M:%S")
+            content = msg['content'] or ""
+            safe_content = content.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            text += f"<b>[{time_str}] {sender}:</b> {safe_content}\n"
+            
+    if len(text) > 4000:
+        text = text[:3950] + "\n\n<i>... [truncated due to length] ...</i>"
+        
+    keyboard = [
+        [
+            InlineKeyboardButton(f"👤 {u1_name}", callback_data=f"admin_view_user_{u1}"),
+            InlineKeyboardButton(f"👤 {u2_name}", callback_data=f"admin_view_user_{u2}")
+        ],
+        [InlineKeyboardButton("🔙 Back to Chat Logs", callback_data="admin_chat_logs")],
+        [InlineKeyboardButton("🏠 Main Admin", callback_data="admin_back")]
+    ]
+    
+    try:
+        if query.message.photo:
+            await query.message.delete()
+            await context.bot.send_message(
+                chat_id=query.from_user.id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    except Exception:
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+async def admin_chat_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """View recent chat history for a single user"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = int(query.data.split('_')[-1])
+    
+    async with db_pool.acquire() as conn:
+        user_row = await conn.fetchrow("SELECT name, username FROM users WHERE telegram_id = $1", user_id)
+        user_name = user_row['name'] if user_row else f"User {user_id}"
+        
+        messages = await conn.fetch("""
+            SELECT cm.sender_id, cm.recipient_id, cm.content, cm.created_at, cm.message_type
+            FROM chat_messages cm
+            WHERE cm.sender_id = $1 OR cm.recipient_id = $1
+            ORDER BY cm.created_at ASC
+            LIMIT 30
+        """, user_id)
+        
+    text = (
+        f"<b>📜 USER CHAT HISTORY</b>\n"
+        f"👤 <b>{user_name}</b> (<code>{user_id}</code>)\n"
+        f"─" * 30 + "\n\n"
+    )
+    
+    if not messages:
+        text += "<i>No messages recorded for this user yet.</i>"
+    else:
+        for msg in messages:
+            direction = "➡️ Sent to" if msg['sender_id'] == user_id else "⬅️ Received from"
+            other_id = msg['recipient_id'] if msg['sender_id'] == user_id else msg['sender_id']
+            time_str = msg['created_at'].strftime("%m/%d %H:%M")
+            content = (msg['content'] or "").replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            text += f"<b>[{time_str}]</b> {direction} <code>{other_id}</code>:\n{content}\n\n"
+            
+    if len(text) > 4000:
+        text = text[:3950] + "\n\n<i>... [truncated due to length] ...</i>"
+        
+    keyboard = [
+        [InlineKeyboardButton(f"👤 Back to {user_name}", callback_data=f"admin_view_user_{user_id}")],
+        [InlineKeyboardButton("🔙 Back to Chat Logs", callback_data="admin_chat_logs")],
+        [InlineKeyboardButton("🏠 Main Admin", callback_data="admin_back")]
+    ]
+    
+    try:
+        if query.message.photo:
+            await query.message.delete()
+            await context.bot.send_message(
+                chat_id=query.from_user.id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    except Exception:
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+async def admin_chatlogs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Direct /chatlogs command: /chatlogs <user_id> or /chatlogs <u1> <u2>"""
+    user_id = update.effective_user.id
+    if user_id != ADMIN_USER_ID:
+        await update.message.reply_text("❌ This command is restricted to administrators.")
+        return
+        
+    if not context.args:
+        help_msg = (
+            "<b>💬 CHAT LOGS ACCESS</b>\n\n"
+            "<b>Usage:</b>\n"
+            "• <code>/chatlogs &lt;user_id&gt;</code> — View recent messages sent/received by this user\n"
+            "• <code>/chatlogs &lt;user1_id&gt; &lt;user2_id&gt;</code> — View direct conversation between two users\n\n"
+            "You can also access chat logs interactively from <code>/admin</code> $\rightarrow$ <b>💬 Chat Logs</b>."
+        )
+        await update.message.reply_text(help_msg, parse_mode="HTML")
+        return
+        
+    if len(context.args) == 1:
+        try:
+            target_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID. Must be numeric.")
+            return
+            
+        async with db_pool.acquire() as conn:
+            user_row = await conn.fetchrow("SELECT name FROM users WHERE telegram_id = $1", target_id)
+            user_name = user_row['name'] if user_row else f"User {target_id}"
+            
+            messages = await conn.fetch("""
+                SELECT cm.sender_id, cm.recipient_id, cm.content, cm.created_at
+                FROM chat_messages cm
+                WHERE cm.sender_id = $1 OR cm.recipient_id = $1
+                ORDER BY cm.created_at ASC
+                LIMIT 30
+            """, target_id)
+            
+        text = f"<b>📜 CHAT LOGS FOR {user_name} (<code>{target_id}</code>)</b>\n" + "─" * 30 + "\n\n"
+        if not messages:
+            text += "<i>No messages found for this user.</i>"
+        else:
+            for msg in messages:
+                direction = "➡️ Sent to" if msg['sender_id'] == target_id else "⬅️ Received from"
+                other_id = msg['recipient_id'] if msg['sender_id'] == target_id else msg['sender_id']
+                time_str = msg['created_at'].strftime("%m/%d %H:%M")
+                content = (msg['content'] or "").replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                text += f"<b>[{time_str}]</b> {direction} <code>{other_id}</code>:\n{content}\n\n"
+                
+        if len(text) > 4000:
+            text = text[:3950] + "\n\n<i>... [truncated] ...</i>"
+        await update.message.reply_text(text, parse_mode="HTML")
+        return
+
+    # Two user IDs provided
+    try:
+        u1 = int(context.args[0])
+        u2 = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("❌ Both user IDs must be numeric.")
+        return
+        
+    async with db_pool.acquire() as conn:
+        u1_row = await conn.fetchrow("SELECT name FROM users WHERE telegram_id = $1", u1)
+        u2_row = await conn.fetchrow("SELECT name FROM users WHERE telegram_id = $1", u2)
+        u1_name = u1_row['name'] if u1_row else f"User {u1}"
+        u2_name = u2_row['name'] if u2_row else f"User {u2}"
+        
+        messages = await conn.fetch("""
+            SELECT cm.sender_id, cm.content, cm.created_at
+            FROM chat_messages cm
+            WHERE (cm.sender_id = $1 AND cm.recipient_id = $2)
+               OR (cm.sender_id = $2 AND cm.recipient_id = $1)
+            ORDER BY cm.created_at ASC
+            LIMIT 30
+        """, u1, u2)
+        
+    text = f"<b>📜 CONVERSATION: {u1_name} ↔️ {u2_name}</b>\n" + "─" * 30 + "\n\n"
+    if not messages:
+        text += "<i>No messages recorded between these two users.</i>"
+    else:
+        for msg in messages:
+            sender = u1_name if msg['sender_id'] == u1 else u2_name
+            time_str = msg['created_at'].strftime("%H:%M:%S")
+            content = (msg['content'] or "").replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            text += f"<b>[{time_str}] {sender}:</b> {content}\n"
+            
+    if len(text) > 4000:
+        text = text[:3950] + "\n\n<i>... [truncated] ...</i>"
+    await update.message.reply_text(text, parse_mode="HTML")
+
+async def admin_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Close admin panel"""
+    query = update.callback_query
+    await query.answer()
+    try:
+        await query.message.delete()
+    except Exception:
+        await query.edit_message_text("👋 Admin panel closed.")
 
 async def admin_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show pending reports"""
@@ -2836,18 +3237,42 @@ async def admin_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     keyboard = [
+        [InlineKeyboardButton("👥 User Management", callback_data="admin_users")],
         [InlineKeyboardButton("📊 Statistics", callback_data="admin_stats")],
         [InlineKeyboardButton("🚨 Reports", callback_data="admin_reports")],
-        [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
-        [InlineKeyboardButton("🔙 Back to Main", callback_data="admin_back")]
+        [InlineKeyboardButton("💬 Chat Logs", callback_data="admin_chat_logs")],
+        [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast_menu")],
+        [InlineKeyboardButton("📝 System Logs", callback_data="admin_logs")],
+        [InlineKeyboardButton("❌ Close Panel", callback_data="admin_close")]
     ]
     
-    await query.edit_message_text(
+    panel_text = (
         "<b>🔧 ADMIN PANEL</b>\n\n"
-        "Select an option below:",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        "Welcome to the administrator dashboard. Select an option below:"
     )
+    
+    try:
+        if query.message.photo:
+            await query.message.delete()
+            await context.bot.send_message(
+                chat_id=query.from_user.id,
+                text=panel_text,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            await query.edit_message_text(
+                panel_text,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+    except Exception:
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text=panel_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 # ---------------- Simplified Broadcast System ----------------
 
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3270,6 +3695,8 @@ async def main():
     app.add_handler(CommandHandler("report", report_user))
     app.add_handler(CommandHandler("requests", view_requests))
     app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("stats", admin_stats_command))
+    app.add_handler(CommandHandler("chatlogs", admin_chatlogs_command))
     app.add_handler(CommandHandler("debug", debug_db))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
 
@@ -3293,6 +3720,10 @@ async def main():
     
     # Admin callbacks
     app.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
+    app.add_handler(CallbackQueryHandler(admin_chat_logs, pattern="^admin_chat_logs$"))
+    app.add_handler(CallbackQueryHandler(admin_view_conversation, pattern="^admin_view_convo_"))
+    app.add_handler(CallbackQueryHandler(admin_chat_history, pattern="^admin_chat_history_"))
+    app.add_handler(CallbackQueryHandler(admin_close, pattern="^admin_close$"))
     app.add_handler(CallbackQueryHandler(admin_reports, pattern="^admin_reports$"))
     app.add_handler(CallbackQueryHandler(admin_broadcast, pattern="^admin_broadcast$"))
     app.add_handler(CallbackQueryHandler(admin_back, pattern="^admin_back$"))

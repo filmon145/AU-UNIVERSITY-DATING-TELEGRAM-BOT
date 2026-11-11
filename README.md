@@ -24,11 +24,13 @@ An interactive Telegram dating and chat bot built for university students using 
   - Users can report inappropriate behavior directly from an active chat or profile card.
   - Direct command support: `/report <user_id> <reason>`.
   - Instant admin alert upon report submission.
-- **Comprehensive Admin Panel (`/admin`)**:
-  - User management (view profiles, ban/unban, search users by ID/username/name).
-  - Real-time statistics (total users, active chats, matches, last 24h activity).
-  - Review and resolve user reports.
-  - Dual broadcast system: rich wizard (text, photo, video, document) or quick reply-to-message broadcast (`/broadcast`).
+- **Comprehensive Admin Suite (`/admin`)**:
+  - **Gender Statistics (`/stats`)**: Breakdown of boys vs. girls counts, percentage ratios, and 24h registration metrics.
+  - **Real-Time Match Alerts**: Instant notifications sent to the admin when two users match, complete with profile links and chat shortcuts.
+  - **Conversation Logging (`/chatlogs`)**: Relayed chat messages (texts and photos) are stored in PostgreSQL for security and privacy audits, accessible via `/chatlogs` or the Admin Panel.
+  - **User Management**: View full profiles, ban/unban, inspect swipes, and search users by ID/username/name.
+  - **System Logs & Reports**: Inspect 24h activity, review reports, and take disciplinary actions.
+  - **Dual Broadcast Modes**: Broadcast via reply command or guided multi-step wizard.
 - **Flexible Execution Modes**:
   - **Polling mode**: Automatic default for local testing and debugging (zero HTTPS setup required).
   - **Webhook mode**: Production-ready webhook server via `aiohttp` for cloud platforms (Render, Heroku, VPS).
@@ -131,5 +133,7 @@ docker run --env-file .env -p 8080:8080 au-dating-bot
 | `/report` | Report current chat partner or `/report <id> <reason>` | All Users |
 | `/requests` | View and accept/decline pending chat requests | All Users |
 | `/admin` | Open interactive administrative control panel | Admin Only |
+| `/stats` | View real-time boys & girls statistics, ratios, and 24h activity | Admin Only |
+| `/chatlogs` | Inspect conversation logs (`/chatlogs <user>` or `/chatlogs <u1> <u2>`) | Admin Only |
 | `/broadcast` | Reply to any message with `/broadcast` to send to all users | Admin Only |
 | `/debug` | Check database connectivity and table stats | Admin Only |
