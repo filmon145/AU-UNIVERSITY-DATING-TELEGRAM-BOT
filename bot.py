@@ -5,7 +5,8 @@ import asyncio
 import asyncpg
 import aiohttp  
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
+import random
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes,
@@ -299,6 +300,31 @@ async def create_tables():
         """)
         print("  ✅ chat_messages table")
         
+        # Super likes table - stores super likes with optional icebreaker notes (1 free per 24h)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS super_likes (
+            id SERIAL PRIMARY KEY,
+            sender_id BIGINT NOT NULL,
+            target_id BIGINT NOT NULL,
+            note TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_super_likes_sender ON super_likes(sender_id, created_at);
+        """)
+        print("  ✅ super_likes table")
+
+        # Active chat reveals table - stores consent to reveal Telegram handles
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS active_chat_reveals (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            partner_id BIGINT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(user_id, partner_id)
+        );
+        """)
+        print("  ✅ active_chat_reveals table")
+
         print("✅ All tables created/verified successfully!")
 
 async def save_profile(update, context):
@@ -949,10 +975,11 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 def get_main_menu():
-    """Get main menu without matches button"""
+    """Get main menu with Who Liked Me button"""
     keyboard = [
         ["🔥 Find Matches", "👤 My Profile"],
-        ["⚙️ Settings", "📢 Report User"]
+        ["❤️ Who Liked Me", "⚙️ Settings"],
+        ["📢 Report User"]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -977,6 +1004,13 @@ async def chat_relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check if user is submitting a report reason
     if 'reporting_user_id' in context.user_data:
         await report_reason(update, context)
+        return
+
+    # Check if user is sending an icebreaker note for Super Like
+    if 'super_like_target_id' in context.user_data:
+        target_id = context.user_data.pop('super_like_target_id')
+        note = update.message.text.strip()
+        await process_super_like(user_id, target_id, note, context, update.message)
         return
 
     # Check if user is in edit mode first
@@ -1048,6 +1082,67 @@ async def photo_relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception as e:
                 print(f"Error sending photo: {e}")
+                await conn.execute("DELETE FROM active_chats WHERE user_id = $1 OR partner_id = $1", user_id)
+                await conn.execute("DELETE FROM active_chats WHERE user_id = $1 OR partner_id = $1", partner_id)
+                await update.message.reply_text("❌ Your partner is no longer available. Chat ended.")
+
+async def voice_relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Relay voice notes between matched users in active chat"""
+    if not update.effective_user or not update.message or not update.message.voice:
+        return
+    
+    user_id = update.effective_user.id
+    
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT partner_id FROM active_chats WHERE user_id = $1", user_id)
+        if row:
+            partner_id = row['partner_id']
+            name_row = await conn.fetchrow("SELECT name FROM users WHERE telegram_id = $1", user_id)
+            sender_name = name_row['name'] if name_row else "User"
+            
+            try:
+                await context.bot.send_voice(
+                    chat_id=partner_id,
+                    voice=update.message.voice.file_id,
+                    caption=f"🎙️ Voice note from {sender_name}"
+                )
+                duration = update.message.voice.duration or 0
+                await conn.execute(
+                    "INSERT INTO chat_messages (sender_id, recipient_id, message_type, content) VALUES ($1, $2, 'voice', $3)",
+                    user_id, partner_id, f"[Voice Note] {duration}s"
+                )
+            except Exception as e:
+                print(f"Error relaying voice note: {e}")
+                await conn.execute("DELETE FROM active_chats WHERE user_id = $1 OR partner_id = $1", user_id)
+                await conn.execute("DELETE FROM active_chats WHERE user_id = $1 OR partner_id = $1", partner_id)
+                await update.message.reply_text("❌ Your partner is no longer available. Chat ended.")
+
+async def sticker_relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Relay stickers between matched users in active chat"""
+    if not update.effective_user or not update.message or not update.message.sticker:
+        return
+    
+    user_id = update.effective_user.id
+    
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT partner_id FROM active_chats WHERE user_id = $1", user_id)
+        if row:
+            partner_id = row['partner_id']
+            name_row = await conn.fetchrow("SELECT name FROM users WHERE telegram_id = $1", user_id)
+            sender_name = name_row['name'] if name_row else "User"
+            
+            try:
+                await context.bot.send_sticker(
+                    chat_id=partner_id,
+                    sticker=update.message.sticker.file_id
+                )
+                emoji = update.message.sticker.emoji or "sticker"
+                await conn.execute(
+                    "INSERT INTO chat_messages (sender_id, recipient_id, message_type, content) VALUES ($1, $2, 'sticker', $3)",
+                    user_id, partner_id, f"[Sticker] {emoji}"
+                )
+            except Exception as e:
+                print(f"Error relaying sticker: {e}")
                 await conn.execute("DELETE FROM active_chats WHERE user_id = $1 OR partner_id = $1", user_id)
                 await conn.execute("DELETE FROM active_chats WHERE user_id = $1 OR partner_id = $1", partner_id)
                 await update.message.reply_text("❌ Your partner is no longer available. Chat ended.")
@@ -1291,6 +1386,13 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
             params = (pref, user_id)
         
         match = await conn.fetchrow(query, *params)
+        
+        # Check daily likes remaining
+        likes_today = await conn.fetchval(
+            "SELECT COUNT(*) FROM swipes WHERE liker_id = $1 AND created_at > NOW() - INTERVAL '24 hours'",
+            user_id
+        ) or 0
+        likes_left = max(0, 15 - likes_today)
 
     if not match:
         text = (
@@ -1323,12 +1425,16 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>👤 Name:</b> {name}\n"
         f"<b>{gender_emoji} Gender:</b> {gender}\n"
         f"<b>📍 Campus:</b> {campus}\n"
-        f"<b>📝 Bio:</b> {bio or 'Not set'}"
+        f"<b>📝 Bio:</b> {bio or 'Not set'}\n\n"
+        f"<i>⚡ Daily Likes Left: {likes_left}/15</i>"
     )
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("❤️ Like", callback_data=f"like_{match_id}"),
-         InlineKeyboardButton("➡️ Next", callback_data="find_next")],
+        [
+            InlineKeyboardButton("❤️ Like", callback_data=f"like_{match_id}"),
+            InlineKeyboardButton("⭐ Super Like", callback_data=f"super_{match_id}"),
+            InlineKeyboardButton("➡️ Next", callback_data="find_next")
+        ],
         [InlineKeyboardButton("🚫 Report", callback_data=f"report_{match_id}")]
     ])
 
@@ -1454,6 +1560,20 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
     liked_id = int(query.data.split('_')[1]) 
 
     async with db_pool.acquire() as conn:
+        # Check daily like limit (15 likes in the last 24 hours)
+        likes_today = await conn.fetchval(
+            "SELECT COUNT(*) FROM swipes WHERE liker_id = $1 AND created_at > NOW() - INTERVAL '24 hours'",
+            user_id
+        ) or 0
+        
+        if likes_today >= 15:
+            await query.answer(
+                "⏳ Daily Like Limit Reached (15/15)!\n\n"
+                "Your likes will refresh in a few hours. You can still use your daily ⭐ Super Like or check back tomorrow!",
+                show_alert=True
+            )
+            return
+
         # Insert the like
         await conn.execute("INSERT INTO swipes (liker_id, liked_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", user_id, liked_id)
         # Remove from passes if it was there
@@ -1584,6 +1704,295 @@ async def handle_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Continue showing more profiles
     return await find_match(update, context)
+
+# ---------------- Super Like & Who Liked Me ----------------
+async def handle_super_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle ⭐ Super Like button click"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    target_id = int(query.data.split('_')[1])
+    
+    async with db_pool.acquire() as conn:
+        # Check if already used 1 free super like in the last 24h
+        last_super = await conn.fetchval(
+            "SELECT created_at FROM super_likes WHERE sender_id = $1 AND created_at > NOW() - INTERVAL '24 hours' ORDER BY created_at DESC LIMIT 1",
+            user_id
+        )
+        if last_super:
+            cooldown_left = last_super + timedelta(hours=24) - datetime.now()
+            hours_left = max(1, int(cooldown_left.total_seconds() // 3600))
+            await query.answer(
+                f"⭐ Daily Super Like already used!\n\nYour 1 free Super Like resets in ~{hours_left} hours.",
+                show_alert=True
+            )
+            return
+
+        target_user = await conn.fetchrow("SELECT name FROM users WHERE telegram_id = $1", target_id)
+        target_name = target_user['name'] if target_user else "this user"
+
+    context.user_data['super_like_target_id'] = target_id
+    
+    kb = [
+        [InlineKeyboardButton("⏭️ Skip Note & Send Super Like", callback_data=f"send_super_{target_id}_skip")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="find_next")]
+    ]
+    
+    prompt = (
+        f"⭐ <b>SUPER LIKE {target_name.upper()}!</b> ⭐\n\n"
+        "Send an introductory icebreaker note (type your message now in chat), "
+        "or click <b>Skip Note</b> below to send immediately!\n\n"
+        "<i>💡 Super Likes stand out at the top of their notifications!</i>"
+    )
+    
+    if query.message.photo:
+        await query.edit_message_caption(caption=prompt, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        await query.edit_message_text(text=prompt, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def super_like_skip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Skip icebreaker note and send super like directly"""
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split('_')
+    target_id = int(parts[2])
+    context.user_data.pop('super_like_target_id', None)
+    await process_super_like(update.effective_user.id, target_id, "", context, query)
+
+async def process_super_like(user_id: int, target_id: int, note: str, context: ContextTypes.DEFAULT_TYPE, message_or_query):
+    """Execute the super like operation and notify target user"""
+    async with db_pool.acquire() as conn:
+        # Record super like
+        await conn.execute(
+            "INSERT INTO super_likes (sender_id, target_id, note) VALUES ($1, $2, $3)",
+            user_id, target_id, note
+        )
+        # Record swipe
+        await conn.execute(
+            "INSERT INTO swipes (liker_id, liked_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            user_id, target_id
+        )
+        # Remove from passes
+        await conn.execute("DELETE FROM passes WHERE user_id = $1 AND passed_id = $2", user_id, target_id)
+        
+        # Check if match
+        is_match = await conn.fetchrow("SELECT 1 FROM swipes WHERE liker_id = $1 AND liked_id = $2", target_id, user_id)
+        
+        sender = await conn.fetchrow("SELECT name, gender, campus, bio, photo_file_id FROM users WHERE telegram_id = $1", user_id)
+        target = await conn.fetchrow("SELECT name, gender, username, campus FROM users WHERE telegram_id = $1", target_id)
+        
+    sender_name = sender['name'] if sender else "Someone"
+    target_name = target['name'] if target else "your match"
+    
+    confirm_text = f"⭐ <b>Super Like sent to {target_name}!</b> 🚀\nThey will be notified with high priority."
+    if hasattr(message_or_query, 'edit_message_text'):
+        try:
+            await message_or_query.edit_message_text(confirm_text, parse_mode="HTML")
+        except Exception:
+            await message_or_query.message.reply_text(confirm_text, parse_mode="HTML")
+    else:
+        await message_or_query.reply_text(confirm_text, parse_mode="HTML")
+        
+    if is_match:
+        # Mutual match!
+        match_alert = "<b>🎆 BOOM! IT'S A MATCH! 🎆</b>\n\nYou both liked each other! Don't wait, say hi! 👋"
+        try:
+            await context.bot.send_message(
+                chat_id=target_id, 
+                text=f"{match_alert}\n\nMatched with: {sender_name}",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💬 Send Message", callback_data=f"chat_{user_id}")]])
+            )
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=match_alert,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💬 Start Chatting", callback_data=f"chat_{target_id}")]])
+            )
+        except Exception:
+            pass
+            
+        if ADMIN_USER_ID:
+            try:
+                admin_match_msg = (
+                    f"🎉 <b>NEW MATCH ALERT (via Super Like)!</b>\n\n"
+                    f"👤 <b>User 1:</b> {sender_name} ({sender['gender'] if sender else 'Unknown'})\n"
+                    f"   ├ 🆔 <code>{user_id}</code>\n"
+                    f"   └ 📍 {sender['campus'] if sender else 'Unknown'}\n\n"
+                    f"👤 <b>User 2:</b> {target_name} ({target['gender'] if target else 'Unknown'})\n"
+                    f"   ├ 🆔 <code>{target_id}</code>\n"
+                    f"   └ 📍 {target['campus'] if target else 'Unknown'}\n\n"
+                    f"⏰ <b>Matched at:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+                admin_kb = [
+                    [
+                        InlineKeyboardButton(f"👤 {sender_name}", callback_data=f"admin_view_user_{user_id}"),
+                        InlineKeyboardButton(f"👤 {target_name}", callback_data=f"admin_view_user_{target_id}")
+                    ],
+                    [
+                        InlineKeyboardButton("💬 View Chat History", callback_data=f"admin_view_convo_{min(user_id, target_id)}_{max(user_id, target_id)}")
+                    ]
+                ]
+                await context.bot.send_message(
+                    chat_id=ADMIN_USER_ID,
+                    text=admin_match_msg,
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(admin_kb)
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify admin: {e}")
+    else:
+        # Deliver Super Like notification with note
+        note_display = f"\n\n💌 <b>Icebreaker Note:</b>\n<i>\"{note}\"</i>" if note else ""
+        gender_emoji = "👨" if sender and sender['gender'] == "Male" else "👩" if sender and sender['gender'] == "Female" else "⚧"
+        super_card = (
+            f"⭐ <b>YOU RECEIVED A SUPER LIKE!</b> ⭐\n\n"
+            f"<b>👤 Name:</b> {sender_name}\n"
+            f"<b>{gender_emoji} Gender:</b> {sender['gender'] if sender else 'Unknown'}\n"
+            f"<b>📍 Campus:</b> {sender['campus'] if sender else 'Unknown'}\n"
+            f"<b>📝 Bio:</b> {sender['bio'] if sender and sender['bio'] else 'Not set'}"
+            f"{note_display}"
+        )
+        
+        super_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💖 Like Back & Match", callback_data=f"like_{user_id}"),
+             InlineKeyboardButton("➡️ Pass", callback_data=f"pass_{user_id}")],
+            [InlineKeyboardButton("🚫 Report", callback_data=f"report_{user_id}")]
+        ])
+        
+        try:
+            if sender and sender['photo_file_id']:
+                await context.bot.send_photo(
+                    chat_id=target_id,
+                    photo=sender['photo_file_id'],
+                    caption=super_card,
+                    parse_mode="HTML",
+                    reply_markup=super_kb
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=target_id,
+                    text=super_card,
+                    parse_mode="HTML",
+                    reply_markup=super_kb
+                )
+        except Exception as e:
+            print(f"Failed to deliver Super Like notification to {target_id}: {e}")
+
+async def who_liked_me(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """View profiles of users who liked you"""
+    user_id = update.effective_user.id
+    is_callback = update.callback_query is not None
+    
+    if is_callback:
+        await update.callback_query.answer()
+        
+    async with db_pool.acquire() as conn:
+        banned = await conn.fetchval("SELECT is_banned FROM users WHERE telegram_id = $1", user_id)
+        if banned:
+            msg = "❌ You have been banned from using this bot."
+            if is_callback:
+                await update.callback_query.message.reply_text(msg)
+            else:
+                await update.message.reply_text(msg)
+            return
+
+        query = """
+            SELECT u.telegram_id, u.name, u.gender, u.campus, u.bio, u.photo_file_id, s.created_at as liked_at
+            FROM swipes s
+            JOIN users u ON u.telegram_id = s.liker_id
+            WHERE s.liked_id = $1
+              AND u.is_banned = FALSE
+              AND u.telegram_id NOT IN (
+                  SELECT liked_id FROM swipes WHERE liker_id = $1
+              )
+              AND u.telegram_id NOT IN (
+                  SELECT passed_id FROM passes WHERE user_id = $1
+              )
+            ORDER BY s.created_at DESC
+        """
+        liked_users = await conn.fetch(query, user_id)
+        
+    if not liked_users:
+        text = (
+            "<b>❤️ WHO LIKED YOU</b>\n\n"
+            "ℹ️ No new pending likes right now!\n\n"
+            "Keep your profile active with /find and check back later."
+        )
+        if is_callback:
+            try:
+                await update.callback_query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            await update.callback_query.message.reply_text(text, parse_mode="HTML")
+        else:
+            await update.message.reply_text(text, parse_mode="HTML")
+        return
+
+    first_user = liked_users[0]
+    total_count = len(liked_users)
+    target_id = first_user['telegram_id']
+    name = first_user['name']
+    gender = first_user['gender']
+    campus = first_user['campus']
+    bio = first_user['bio'] or "Not set"
+    photo = first_user['photo_file_id']
+    gender_emoji = "👨" if gender == "Male" else "👩" if gender == "Female" else "⚧"
+    
+    text = (
+        f"❤️ <b>SOMEONE LIKED YOU! ({total_count} pending)</b>\n\n"
+        f"<b>👤 Name:</b> {name}\n"
+        f"<b>{gender_emoji} Gender:</b> {gender}\n"
+        f"<b>📍 Campus:</b> {campus}\n"
+        f"<b>📝 Bio:</b> {bio}\n\n"
+        f"<i>Tap below to like them back and start chatting!</i>"
+    )
+    
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("💖 Like Back & Match", callback_data=f"like_{target_id}"),
+            InlineKeyboardButton("➡️ Pass", callback_data=f"pass_{target_id}")
+        ],
+        [InlineKeyboardButton("🚫 Report", callback_data=f"report_{target_id}")]
+    ])
+    
+    if is_callback:
+        try:
+            await update.callback_query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        if photo:
+            await context.bot.send_photo(chat_id=user_id, photo=photo, caption=text, reply_markup=kb, parse_mode="HTML")
+        else:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=kb, parse_mode="HTML")
+    else:
+        if photo:
+            await update.message.reply_photo(photo=photo, caption=text, reply_markup=kb, parse_mode="HTML")
+        else:
+            await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
+
+async def handle_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle skipping a profile from Who Liked Me or Super Like"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    passed_id = int(query.data.split('_')[1])
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO passes (user_id, passed_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            user_id, passed_id
+        )
+        
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+        
+    # Show next pending like
+    await who_liked_me(update, context)
 
 # ---------------- Edit Profile System ----------------
 async def start_edit_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3476,17 +3885,28 @@ async def start_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         my_row = await conn.fetchrow("SELECT name FROM users WHERE telegram_id = $1", user_id)
         my_name = my_row['name'] if my_row else "Someone"
 
+    chat_controls_kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🎲 Icebreaker", callback_data="chat_icebreaker"),
+            InlineKeyboardButton("🤝 Reveal Username", callback_data="chat_reveal")
+        ],
+        [InlineKeyboardButton("🛑 End Chat (/stop)", callback_data="chat_stop")]
+    ])
+
     ice_breaker = (
         "<b>🎬 THE STAGE IS YOURS!</b>\n\n"
         "You are now connected. Don't be shy—start with a 'Hi' or your favorite emoji! 🥂\n\n"
-        "<i>💡 Type /stop at any time to end this chat.</i>"
+        "<i>💡 Controls below:\n"
+        "• 🎲 <b>Icebreaker</b>: Random question to start talking\n"
+        "• 🤝 <b>Reveal Username</b>: Share Telegram handles with mutual consent\n"
+        "• 🛑 <b>End Chat</b>: Disconnect at any time</i>"
     )
 
     msg_text = f"<b>✅ CONNECTION ESTABLISHED WITH {partner_name}!</b>\n\n{ice_breaker}"
     if query.message.photo:
-        await query.edit_message_caption(caption=msg_text, parse_mode="HTML")
+        await query.edit_message_caption(caption=msg_text, parse_mode="HTML", reply_markup=chat_controls_kb)
     else:
-        await query.edit_message_text(text=msg_text, parse_mode="HTML")
+        await query.edit_message_text(text=msg_text, parse_mode="HTML", reply_markup=chat_controls_kb)
     
     try:
         partner_alert = (
@@ -3496,12 +3916,17 @@ async def start_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=partner_id,
             text=partner_alert,
-            parse_mode="HTML"
+            parse_mode="HTML",
+            reply_markup=chat_controls_kb
         )
     except:
         pass
 
 async def stop_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    is_callback = update.callback_query is not None
+    if is_callback:
+        await update.callback_query.answer()
+        
     user_id = update.effective_user.id
     partner_id = None
     
@@ -3512,6 +3937,7 @@ async def stop_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await conn.execute("DELETE FROM active_chats WHERE user_id = $1 OR partner_id = $1", user_id)
         await conn.execute("DELETE FROM active_chats WHERE user_id = $1 OR partner_id = $1", partner_id)
+        await conn.execute("DELETE FROM active_chat_reveals WHERE user_id = $1 OR partner_id = $1", user_id)
         
         if partner_id:
             await conn.execute(
@@ -3525,12 +3951,181 @@ async def stop_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=partner_id,
                 text="<b>❌ YOUR CHAT PARTNER HAS ENDED THE CONVERSATION.</b>\n\n"
                      "If you want to reconnect, they will need to accept your new request.\n"
-                     "Use /requests to manage reconnection requests."
+                     "Use /requests to manage reconnection requests.",
+                parse_mode="HTML"
             )
         except:
             pass
     
-    await update.message.reply_text("📴 Chat ended. The other user will need your permission to reconnect.")
+    farewell = "📴 Chat ended. The other user will need your permission to reconnect."
+    if is_callback:
+        try:
+            await update.callback_query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await update.callback_query.message.reply_text(farewell)
+    else:
+        await update.message.reply_text(farewell)
+
+async def chat_reveal_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mutual reveal consent for Telegram username handles"""
+    is_callback = update.callback_query is not None
+    if is_callback:
+        await update.callback_query.answer()
+        
+    user_id = update.effective_user.id
+    
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT partner_id FROM active_chats WHERE user_id = $1", user_id)
+        if not row:
+            msg = "❌ You are not in an active chat right now."
+            if is_callback:
+                await update.callback_query.message.reply_text(msg)
+            else:
+                await update.message.reply_text(msg)
+            return
+            
+        partner_id = row['partner_id']
+        
+        # Record current user consent
+        await conn.execute("""
+            INSERT INTO active_chat_reveals (user_id, partner_id) 
+            VALUES ($1, $2)
+            ON CONFLICT (user_id, partner_id) DO NOTHING
+        """, user_id, partner_id)
+        
+        # Check if partner has also consented
+        partner_consented = await conn.fetchrow(
+            "SELECT 1 FROM active_chat_reveals WHERE user_id = $1 AND partner_id = $2",
+            partner_id, user_id
+        )
+        
+        u1 = await conn.fetchrow("SELECT name, username FROM users WHERE telegram_id = $1", user_id)
+        u2 = await conn.fetchrow("SELECT name, username FROM users WHERE telegram_id = $1", partner_id)
+
+    u1_name = u1['name'] if u1 else "User"
+    u1_user = f"@{u1['username']}" if u1 and u1['username'] else "No public username set"
+    u1_link = f"https://t.me/{u1['username']}" if u1 and u1['username'] else f"tg://user?id={user_id}"
+
+    u2_name = u2['name'] if u2 else "User"
+    u2_user = f"@{u2['username']}" if u2 and u2['username'] else "No public username set"
+    u2_link = f"https://t.me/{u2['username']}" if u2 and u2['username'] else f"tg://user?id={partner_id}"
+
+    if partner_consented:
+        # Both consented! Send mutual reveal to both users
+        msg_for_u1 = (
+            "🎉 <b>MUTUAL IDENTITY REVEAL!</b> 🎉\n\n"
+            "Both of you agreed to share Telegram handles!\n\n"
+            f"👤 <b>Partner:</b> {u2_name}\n"
+            f"📛 <b>Username:</b> {u2_user}\n"
+            f"🔗 <b>Direct Link:</b> <a href=\"{u2_link}\">Open Telegram Chat</a>\n\n"
+            "You can continue chatting here or switch to private DMs!"
+        )
+        msg_for_u2 = (
+            "🎉 <b>MUTUAL IDENTITY REVEAL!</b> 🎉\n\n"
+            "Both of you agreed to share Telegram handles!\n\n"
+            f"👤 <b>Partner:</b> {u1_name}\n"
+            f"📛 <b>Username:</b> {u1_user}\n"
+            f"🔗 <b>Direct Link:</b> <a href=\"{u1_link}\">Open Telegram Chat</a>\n\n"
+            "You can continue chatting here or switch to private DMs!"
+        )
+        try:
+            await context.bot.send_message(chat_id=user_id, text=msg_for_u1, parse_mode="HTML")
+            await context.bot.send_message(chat_id=partner_id, text=msg_for_u2, parse_mode="HTML")
+        except Exception as e:
+            print(f"Error sending reveal: {e}")
+    else:
+        # Only current user consented so far
+        status_msg = (
+            "✅ <b>You agreed to reveal your username!</b>\n\n"
+            "We've sent a notification to your partner. If they agree to reveal too, both handles will be shared!"
+        )
+        if is_callback:
+            await update.callback_query.message.reply_text(status_msg, parse_mode="HTML")
+        else:
+            await update.message.reply_text(status_msg, parse_mode="HTML")
+            
+        prompt_partner = (
+            f"🤝 <b>{u1_name} wants to exchange Telegram usernames!</b>\n\n"
+            "If you also want to reveal your username and get theirs, click below:"
+        )
+        agree_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🤝 Agree & Reveal Username", callback_data="chat_reveal")]
+        ])
+        try:
+            await context.bot.send_message(
+                chat_id=partner_id,
+                text=prompt_partner,
+                parse_mode="HTML",
+                reply_markup=agree_kb
+            )
+        except Exception:
+            pass
+
+ICEBREAKER_QUESTIONS = [
+    "What's the best cafe or spot to hang out around campus? ☕",
+    "If you could skip one class for the rest of university with an A, which would it be? 📚",
+    "What song or artist has been on repeat for you lately? 🎧",
+    "What's your go-to late-night study snack? 🍕",
+    "Are you a morning person or a night owl on campus? 🦉",
+    "What's the funniest or most unexpected thing you've witnessed in a lecture? 😂",
+    "What's your dream vacation spot once semester exams are over? ✈️",
+    "If we went to lunch right now, where are we going? 🍔",
+    "What's one hobby or skill you really want to learn this year? 🎨",
+    "Coffee or tea before morning class? ☕🍵",
+    "What's the best movie or series you've watched recently? 🎬",
+    "If you had a superpower for 24 hours on campus, what would it be? 🦸",
+    "What's your favorite spot on campus to relax between classes? 🌿",
+    "Do you prefer study groups or studying alone with headphones? 📖",
+    "What's your most memorable moment at university so far? ✨",
+    "What's a weird food combination that you actually enjoy? 🍟",
+    "What kind of music gets you hyped before an exam or event? 🎵",
+    "Are you spontaneous or do you plan every hour of your weekend? 📅",
+    "What's something people usually get wrong about you when they first meet you? 🤔",
+    "If you could time travel, would you visit the past or the future? ⏳"
+]
+
+async def chat_icebreaker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send a random icebreaker question to both chat partners"""
+    is_callback = update.callback_query is not None
+    if is_callback:
+        await update.callback_query.answer()
+        
+    user_id = update.effective_user.id
+    
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT partner_id FROM active_chats WHERE user_id = $1", user_id)
+        if not row:
+            msg = "❌ You are not in an active chat right now."
+            if is_callback:
+                await update.callback_query.message.reply_text(msg)
+            else:
+                await update.message.reply_text(msg)
+            return
+            
+        partner_id = row['partner_id']
+        name_row = await conn.fetchrow("SELECT name FROM users WHERE telegram_id = $1", user_id)
+        user_name = name_row['name'] if name_row else "Your partner"
+
+    question = random.choice(ICEBREAKER_QUESTIONS)
+    
+    broadcast_msg = (
+        f"🎲 <b>ICEBREAKER QUESTION (suggested by {user_name}):</b>\n\n"
+        f"<i>\"{question}\"</i>\n\n"
+        f"💬 Both of you send your answer below!"
+    )
+    
+    try:
+        await context.bot.send_message(chat_id=user_id, text=broadcast_msg, parse_mode="HTML")
+        await context.bot.send_message(chat_id=partner_id, text=broadcast_msg, parse_mode="HTML")
+        
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO chat_messages (sender_id, recipient_id, message_type, content) VALUES ($1, $2, 'icebreaker', $3)",
+                user_id, partner_id, f"[Icebreaker] {question}"
+            )
+    except Exception as e:
+        print(f"Error sending icebreaker: {e}")
 
 async def view_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """View pending chat requests"""
@@ -3690,6 +4285,9 @@ async def main():
     # Commands
     app.add_handler(CommandHandler("find", find_match))
     app.add_handler(CommandHandler("myprofile", show_my_profile))
+    app.add_handler(CommandHandler("likes", who_liked_me))
+    app.add_handler(CommandHandler("reveal", chat_reveal_callback))
+    app.add_handler(CommandHandler("icebreaker", chat_icebreaker_callback))
     app.add_handler(CommandHandler("settings", set_preference))
     app.add_handler(CommandHandler("stop", stop_chat))
     app.add_handler(CommandHandler("report", report_user))
@@ -3702,6 +4300,12 @@ async def main():
 
     # Callback query handlers
     app.add_handler(CallbackQueryHandler(handle_like, pattern="^(like_|report_)"))
+    app.add_handler(CallbackQueryHandler(handle_super_like, pattern="^super_"))
+    app.add_handler(CallbackQueryHandler(super_like_skip_callback, pattern="^send_super_"))
+    app.add_handler(CallbackQueryHandler(handle_pass, pattern="^pass_"))
+    app.add_handler(CallbackQueryHandler(chat_icebreaker_callback, pattern="^chat_icebreaker$"))
+    app.add_handler(CallbackQueryHandler(chat_reveal_callback, pattern="^chat_reveal$"))
+    app.add_handler(CallbackQueryHandler(stop_chat, pattern="^chat_stop$"))
     app.add_handler(CallbackQueryHandler(start_chat, pattern="^chat_"))
     app.add_handler(CallbackQueryHandler(find_match, pattern="find_next"))
     app.add_handler(CallbackQueryHandler(save_preference, pattern="^pref_"))
@@ -3745,12 +4349,15 @@ async def main():
     # Menu button handlers
     app.add_handler(MessageHandler(filters.Regex("^🔥 Find Matches$"), find_match))
     app.add_handler(MessageHandler(filters.Regex("^👤 My Profile$"), show_my_profile))
+    app.add_handler(MessageHandler(filters.Regex("^❤️ Who Liked Me$"), who_liked_me))
     app.add_handler(MessageHandler(filters.Regex("^⚙️ Settings$"), set_preference))
     app.add_handler(MessageHandler(filters.Regex("^📢 Report User$"), report_user))
 
     # Message handlers (chat_relay delegates to edit, search, and report when active)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_relay))
     app.add_handler(MessageHandler(filters.PHOTO, photo_relay))
+    app.add_handler(MessageHandler(filters.VOICE, voice_relay))
+    app.add_handler(MessageHandler(filters.Sticker.ALL, sticker_relay))
     
     # Broadcast conversation wizard handler
     broadcast_conv_handler = ConversationHandler(

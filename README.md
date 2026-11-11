@@ -13,9 +13,14 @@ An interactive Telegram dating and chat bot built for university students using 
   - Filter candidates by preference (Male, Female, Both).
   - Session-aware matching that avoids repeating skipped profiles.
   - Mutual like detection ("It's a Match! 🎉") with real-time notifications.
-- **Direct Anonymous Chat Relay**:
-  - Connected users can chat in real time directly through the bot.
-  - Seamless relay of text messages and photos.
+  - **⚡ Daily Like Limit**: 15 likes per 24 hours to prevent spam and encourage quality connections.
+  - **⭐ Super Likes**: 1 free Super Like per 24 hours with an introductory icebreaker note delivered with high priority.
+  - **❤️ "Who Liked You" List (`/likes`)**: Review incoming likes and instantly match back.
+- **Interactive Chat System**:
+  - Connected users chat in real time directly through the bot.
+  - Seamless relay of **Text, Photos, Voice Notes (`🎙️`), and Animated/Static Stickers**.
+  - **🎲 Random Icebreakers (`/icebreaker`)**: 20+ fun conversation starter prompts.
+  - **🤝 Reveal Handles (`/reveal`)**: Mutual consent mechanism to exchange Telegram usernames (`@handle`) and direct chat links.
   - End chat at any time using `/stop`.
 - **Chat Requests**:
   - Send direct chat requests to matched users.
@@ -27,7 +32,7 @@ An interactive Telegram dating and chat bot built for university students using 
 - **Comprehensive Admin Suite (`/admin`)**:
   - **Gender Statistics (`/stats`)**: Breakdown of boys vs. girls counts, percentage ratios, and 24h registration metrics.
   - **Real-Time Match Alerts**: Instant notifications sent to the admin when two users match, complete with profile links and chat shortcuts.
-  - **Conversation Logging (`/chatlogs`)**: Relayed chat messages (texts and photos) are stored in PostgreSQL for security and privacy audits, accessible via `/chatlogs` or the Admin Panel.
+  - **Conversation Logging (`/chatlogs`)**: Relayed chat messages (texts, photos, voice notes, stickers) are stored in PostgreSQL for security and privacy audits, accessible via `/chatlogs` or the Admin Panel.
   - **User Management**: View full profiles, ban/unban, inspect swipes, and search users by ID/username/name.
   - **System Logs & Reports**: Inspect 24h activity, review reports, and take disciplinary actions.
   - **Dual Broadcast Modes**: Broadcast via reply command or guided multi-step wizard.
@@ -127,8 +132,11 @@ docker run --env-file .env -p 8080:8080 au-dating-bot
 |---|---|---|
 | `/start` | Start registration or open the main menu | All Users |
 | `/find` | Browse profiles and find matches | Registered Users |
+| `/likes` | View users who liked your profile ("Who Liked Me") | Registered Users |
 | `/myprofile` | View and edit your profile card | Registered Users |
 | `/settings` | Update matching preferences (Male / Female / Both) | Registered Users |
+| `/icebreaker`| Send a random conversation starter into an active chat | In-Chat Users |
+| `/reveal` | Propose mutual Telegram handle/username exchange | In-Chat Users |
 | `/stop` | Disconnect from the current active chat | In-Chat Users |
 | `/report` | Report current chat partner or `/report <id> <reason>` | All Users |
 | `/requests` | View and accept/decline pending chat requests | All Users |
